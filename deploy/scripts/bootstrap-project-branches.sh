@@ -22,15 +22,19 @@
 # "conectar un proyecto nuevo" para el resto de los pasos):
 #   - No crea el Jenkinsfile del proyecto (paso de código, no de infra
 #     GitHub).
-#   - No crea el webhook GitHub -> Jenkins por repo: desde el ticket 002
-#     (punto 6), el plugin "github" de Jenkins lo gestiona automático a
-#     nivel de organización (JCasC, gitHubPluginConfig.manageHooks) en
-#     cuanto el Organization Folder escanea el repo por primera vez. Ese
-#     primer escaneo SÍ es manual (Jenkins > 64Bit Studio > "Scan
-#     Organization Folder Now") o espera hasta 4h (trigger periódico) --
-#     es la única acción humana que queda en todo este flujo, porque
-#     requiere estar autenticado en la UI de Jenkins (gestionada 100% a
-#     mano desde el ticket 049, sin token de API expuesto a este script).
+#
+# Webhook GitHub -> Jenkins (punto 6): SÍ lo crea este script, por API,
+# con las credenciales de "gh" (que ya funcionan de sobra para todo lo
+# demás aquí). Ajuste real sobre el plan original: se intentó primero
+# que el plugin "github" de Jenkins lo gestionara solo, a nivel de
+# organización (JCasC, gitHubPluginConfig.manageHooks) -- funciona para
+# ACTUALIZAR un webhook que ya existe, pero falla con "401 Bad
+# credentials" al intentar CREAR uno nuevo (el cliente REST interno del
+# plugin, librería github-api, no acepta el credential tipo usuario+PAT
+# de la misma forma que sí lo acepta git para checkout/push -- ver
+# docs/ARQUITECTURA.md para el log real y el diagnóstico completo). Se
+# abandonó esa vía por frágil y se volvió a este script, que sí es
+# confiable y mantiene el principio de "un solo comando".
 
 set -euo pipefail
 
@@ -117,10 +121,50 @@ for branch in dev qa prod; do
   echo "$PROTECTION_JSON" | gh api --method PUT "repos/${OWNER}/${REPO}/branches/${branch}/protection" --input - >/dev/null
 done
 
+# 4. Webhook GitHub -> Jenkins (punto 6) -- mismo patrón que se usó a
+#    mano para auth-core-mc (evento push, JSON content-type, sin
+#    verificación SSL especial -- TLS real de Let's Encrypt). Idempotente:
+#    busca por URL antes de crear, nunca duplica.
+JENKINS_HOOK_URL="https://jenkins.64bitstudio.com/github-webhook/"
+echo "Verificando webhook GitHub -> Jenkins..."
+EXISTING_HOOK_ID=$(gh api "repos/${OWNER}/${REPO}/hooks" --jq ".[] | select(.config.url==\"${JENKINS_HOOK_URL}\") | .id" | head -1)
+
+if [ -n "$EXISTING_HOOK_ID" ]; then
+  echo "Webhook a Jenkins ya existe (id ${EXISTING_HOOK_ID})."
+else
+  echo "Creando webhook GitHub -> Jenkins..."
+  HOOK_JSON=$(cat <<JSON
+{
+  "name": "web",
+  "active": true,
+  "events": ["push"],
+  "config": {
+    "url": "${JENKINS_HOOK_URL}",
+    "content_type": "json",
+    "insecure_ssl": "0"
+  }
+}
+JSON
+)
+  echo "$HOOK_JSON" | gh api --method POST "repos/${OWNER}/${REPO}/hooks" --input - >/dev/null
+  EXISTING_HOOK_ID=$(gh api "repos/${OWNER}/${REPO}/hooks" --jq ".[] | select(.config.url==\"${JENKINS_HOOK_URL}\") | .id" | head -1)
+fi
+
+# Verificación real (no solo que la API de GitHub aceptó el POST): un
+# ping real al webhook y confirmar que Jenkins respondió 200.
+echo "Pingeando el webhook para confirmar que Jenkins responde..."
+gh api --method POST "repos/${OWNER}/${REPO}/hooks/${EXISTING_HOOK_ID}/pings" >/dev/null
+sleep 3
+PING_STATUS=$(gh api "repos/${OWNER}/${REPO}/hooks/${EXISTING_HOOK_ID}" --jq '.last_response.code')
+if [ "$PING_STATUS" = "200" ]; then
+  echo "Webhook confirmado -- Jenkins respondió 200 al ping real."
+else
+  echo "⚠️  El último response code del webhook es '${PING_STATUS}', no 200 -- revisar a mano (gh api repos/${OWNER}/${REPO}/hooks/${EXISTING_HOOK_ID})." >&2
+fi
+
 echo ""
 echo "== Listo =="
-echo "dev/qa/prod creadas (o ya existentes) + branch protection aplicada."
+echo "dev/qa/prod creadas (o ya existentes) + branch protection + webhook a Jenkins, todo en esta sola corrida."
 echo "Pendiente (única acción manual real, ver el comentario al inicio de este script):"
 echo "  1. Agregar el Jenkinsfile del proyecto (usando @Library('platform') corePipeline(...))."
-echo "  2. En Jenkins (https://jenkins.64bitstudio.com/job/64bitstudio/) -> 'Scan Organization Folder Now',"
-echo "     para que Jenkins descubra ${REPO} y su webhook se auto-cree (o esperar hasta 4h al trigger periódico)."
+echo "     En cuanto se pushee, el webhook recién creado dispara el build real -- sin rescan manual."
