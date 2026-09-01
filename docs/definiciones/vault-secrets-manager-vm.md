@@ -1,5 +1,10 @@
 # Definición: Vault como secrets manager general de la VM compartida
 
+**✅ VoBo final de Marco confirmado (2026-09-01).** Documento cerrado
+para definición — listo para desglosar en tickets reales
+(`platform/003` a `007`). Cualquier cambio de alcance a partir de aquí
+se gestiona como cambio de ticket, no editando este documento.
+
 **Reformulado 2026-09-01** — versión original del 2026-08-31, revisada
 tras el ticket `platform/002` (endurecimiento de la infra base) y el
 resize real de la VM. Se conserva el diseño central (Vault + auto-unseal
