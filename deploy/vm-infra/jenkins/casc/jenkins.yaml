@@ -99,3 +99,45 @@ unclassified:
       - name: "sonarqube-vm"
         serverUrl: "${SONAR_HOST_URL:-http://sonarqube:9000}"
         credentialsId: "sonar-token"
+  # Ticket 002, punto 3: Shared Library con los pasos comunes de pipeline
+  # (vars/corePipeline.groovy, en la raíz de ESTE repo). Cada Jenkinsfile
+  # de core la referencia con "@Library('platform') _" -- implicit:false
+  # a propósito, para que quede explícito en cada Jenkinsfile qué
+  # versión/librería usa, en vez de cargarse sola en todo pipeline de la
+  # instalación. defaultVersion "main" seguro porque platform no tiene
+  # ambientes propios (ver docs/ARQUITECTURA.md) -- un cambio a la
+  # librería aplica de inmediato al siguiente build de cualquier core,
+  # sin paso de promoción intermedio (aceptado: es infra de CI, no una
+  # imagen desplegada a un ambiente con tráfico real).
+  globalLibraries:
+    libraries:
+      - name: "platform"
+        defaultVersion: "main"
+        implicit: false
+        allowVersionOverride: true
+        includeInChangesets: false
+        retriever:
+          modernSCM:
+            scm:
+              git:
+                remote: "https://github.com/64bitstudio/platform.git"
+                credentialsId: "github-pat"
+  # Ticket 002, punto 6 (investigado antes de asumir que hacía falta un
+  # webhook manual por repo -- ver docs/ARQUITECTURA.md, runbook "conectar
+  # un proyecto nuevo"): SÍ existe un mecanismo a nivel de organización.
+  # Con "Manage hooks" activado aquí (mismo credential "github-pat" que ya
+  # usa el Organization Folder para escanear 64bitstudio), el plugin
+  # "github" crea/actualiza automáticamente el webhook push de CUALQUIER
+  # repo que el Organization Folder descubra (branch con Jenkinsfile) --
+  # ya no hace falta `POST /repos/<owner>/<repo>/hooks` a mano ni por
+  # script para ningún core nuevo. El webhook ya existente de
+  # auth-core-mc (creado a mano el 2026-08-31) queda re-gestionado por
+  # este mecanismo a partir de aquí (misma URL:
+  # https://jenkins.64bitstudio.com/github-webhook/, sin cambio real).
+  gitHubPluginConfig:
+    configs:
+      - name: "github.com (64bitstudio)"
+        apiUrl: "https://api.github.com"
+        credentialsId: "github-pat"
+        manageHooks: true
+        clientCacheSize: 20

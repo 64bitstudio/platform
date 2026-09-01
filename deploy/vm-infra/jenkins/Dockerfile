@@ -55,3 +55,10 @@ USER jenkins
 
 COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
 RUN jenkins-plugin-cli --plugin-file /usr/share/jenkins/ref/plugins.txt
+
+# Ticket 002, punto 1: comentario deliberado para forzar un cambio real
+# de hash (rebuild + recreate del contenedor) y verificar en vivo, contra
+# un build de auth-core-mc corriendo al mismo tiempo, que el nuevo paso
+# "Esperar si Jenkins tiene un build activo antes de recrearlo" (ci.yml)
+# ya no lo mata en seco -- ver docs/ARQUITECTURA.md para la evidencia de
+# esta verificación real.

@@ -192,14 +192,74 @@ jobs:
       # Jenkins necesita leer los secrets de cada core para que su
       # Jenkinsfile pueda desplegarlo (mismo patrón de permisos ya
       # documentado en el ticket 049 de auth-core-mc: "leer por grupo"
-      # exige también traversal en cada directorio del camino). Esta
-      # lista crece con cada core nuevo (mail-core-mc, etc.) -- agregar
-      # su línea aquí cuando llegue, no repetir el job completo.
+      # exige también traversal en cada directorio del camino).
+      # Generalizado (ticket 002, punto 5): antes hardcodeado solo a
+      # auth-core-mc -- ahora itera TODOS los subdirectorios de
+      # /home/ubuntu/secrets/ que sean de un proyecto (todo menos
+      # "jenkins", que son secrets propios de Jenkins, sin necesidad de
+      # acceso de grupo). Un core nuevo (mail-core-mc, etc.) queda
+      # cubierto en cuanto Marco cree su carpeta de secrets, sin tocar
+      # este workflow.
       - name: Permisos de grupo en los secrets de cada proyecto (para Jenkins)
         run: |
           chmod 710 /home/ubuntu/secrets 2>/dev/null || true
-          chmod 750 /home/ubuntu/secrets/auth-core-mc 2>/dev/null || true
-          chmod 640 /home/ubuntu/secrets/auth-core-mc/.env.* 2>/dev/null || true
+          for dir in /home/ubuntu/secrets/*/; do
+            [ -d "$dir" ] || continue
+            name=$(basename "$dir")
+            [ "$name" = "jenkins" ] && continue
+            chmod 750 "$dir" 2>/dev/null || true
+            chmod 640 "$dir"/.env.* 2>/dev/null || true
+          done
+
+      # Ticket 002, punto 1 (hallazgo real del primer push de este repo,
+      # ver docs/ARQUITECTURA.md: recrear Jenkins mató en seco un build de
+      # gradle en curso de auth-core-mc). Cualquier "docker compose ... up
+      # -d" de Jenkins de abajo PUEDE recrear el contenedor aunque no haya
+      # cambiado Dockerfile/plugins.txt (basta con que cambie algo de su
+      # config real, p.ej. la ruta absoluta del bind mount de casc/ --
+      # exactamente lo que pasó). Antes de tocar el contenedor, se espera
+      # a que Jenkins NO tenga ningún build corriendo un paso de verdad
+      # ahora mismo -- sin usar la API HTTP de Jenkins (que exige login,
+      # gestionado 100% por UI desde el ticket 049 y no disponible aquí
+      # sin credenciales nuevas): se lee directo el build.xml de cada
+      # build en jenkins_home vía "docker exec" (no requiere auth). Un
+      # build "no completado" (build.xml sin <result>) por sí solo NO
+      # basta -- el stage "¿Promover a PROD?" puede quedar pausado hasta
+      # 7 días esperando el clic de Marco, sosteniendo su executor sin
+      # ejecutar nada; eso NO debe bloquear la recreación. Se distingue
+      # con el mtime del log: si cambió en los últimos 30s, hay un paso
+      # ejecutando algo de verdad ahora mismo.
+      - name: Esperar si Jenkins tiene un build activo antes de recrearlo
+        run: |
+          if ! docker ps --format '{{.Names}}' | grep -qx jenkins; then
+            echo "Jenkins no está corriendo todavía (primer bootstrap) -- nada que esperar."
+            exit 0
+          fi
+          MAX_WAIT=600
+          WAITED=0
+          while true; do
+            ACTIVE=$(docker exec jenkins sh -c '
+              for b in $(find /var/jenkins_home/jobs -mindepth 5 -maxdepth 5 -type d -regex ".*/builds/[0-9]+$" 2>/dev/null); do
+                [ -f "$b/build.xml" ] || continue
+                grep -q "<result>" "$b/build.xml" && continue
+                [ -f "$b/log" ] || continue
+                if [ $(( $(date +%s) - $(stat -c %Y "$b/log") )) -lt 30 ]; then
+                  echo "$b"
+                fi
+              done
+            ' 2>/dev/null | head -1)
+            if [ -z "$ACTIVE" ]; then
+              echo "Sin build activo -- seguro recrear Jenkins si hace falta."
+              break
+            fi
+            if [ "$WAITED" -ge "$MAX_WAIT" ]; then
+              echo "::warning::Build activo ($ACTIVE) tras ${MAX_WAIT}s de espera -- se procede de todas formas (excepción conocida, no un silencio: un build real no debería tardar tanto; si esto se repite, investigar por qué)."
+              break
+            fi
+            echo "Build activo ($ACTIVE) -- esperando 20s antes de reintentar ($WAITED/${MAX_WAIT}s)..."
+            sleep 20
+            WAITED=$((WAITED + 20))
+          done
 
       # Reconstruye la imagen de Jenkins solo cuando algo que de verdad la
       # define (Dockerfile o plugins.txt) cambió, comparando contra un
