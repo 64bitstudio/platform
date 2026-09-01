@@ -766,24 +766,20 @@ vivo que un contenedor Docker con networking por default (sin
 curlimages/curl ... http://169.254.169.254/opc/v2/instance/id` devolvió
 el OCID real de la instancia).
 
-**Bloqueo real -- pendiente de Marco**: crear el Dynamic Group y la
-Policy de IAM que autorizan a la VM a *usar* (nunca administrar) esa
-llave específica está bloqueado para este agente por el clasificador de
-permisos (cambio de seguridad a nivel de la cuenta/tenancy de OCI, fuera
-de lo que un agente debe decidir solo). Comando exacto, un solo bloque,
-para correr desde la Mac (ya tiene `oci` CLI configurado y probado en
-esta sesión):
-
-```bash
-oci iam dynamic-group create --compartment-id ocid1.tenancy.oc1..aaaaaaaamhyw2ekupvxrpal3ohic74niksj3tobwosl2g3j4eljxxatykgeq --name platform-vm-vault-dg --description "VM ampere-free -- Vault OSS auto-unseal via instance principal (ticket platform/003)" --matching-rule "instance.id = 'ocid1.instance.oc1.mx-queretaro-1.anyxeljr4cdrmjycn32ejrpfwuuah3ga2y33puvqcsz2t223hqvlqp5n6sbq'" && oci iam policy create --compartment-id ocid1.tenancy.oc1..aaaaaaaamhyw2ekupvxrpal3ohic74niksj3tobwosl2g3j4eljxxatykgeq --name platform-vm-vault-autounseal-policy --description "Least privilege: solo usar (no administrar) la llave de auto-unseal de Vault (ticket platform/003)" --statements "[\"Allow dynamic-group platform-vm-vault-dg to use keys in tenancy where target.key.id = 'ocid1.key.oc1.mx-queretaro-1.ibvjm2v7aaana.abyxeljr6u3fcjpcn6aj5wr3o2mtyf2yggk63r6yfrgrdk5wke26gzn6f4ha'\"]"
-```
-
-Verificado en vivo (no en teoría) que el bloqueo real es exactamente
-este y nada más: con la configuración completa ya en su lugar, el
-contenedor de Vault sí llega a OCI KMS (no es un problema de red/IMDS) y
-falla con el error explícito `NotAuthorizedOrNotFound` al intentar usar
-la llave -- exactamente lo que falta hasta que exista el Dynamic
-Group/Policy de arriba.
+**Bloqueo real -- RESUELTO por Marco (2026-09-01, ~06:42 UTC)**: creó el
+Dynamic Group (`platform-vm-vault-dg`,
+`ocid1.dynamicgroup.oc1..aaaaaaaakop3qaashtxcrc5aj5befgru4ylvywm2lnr5s5762u6355nxllqq`)
+y la Policy (`platform-vm-vault-autounseal-policy`,
+`ocid1.policy.oc1..aaaaaaaazg4vw5devhq47o4sn4aab6xmvyj42agbzd7oksf7j6vzixbyx6jq`,
+statement: `Allow dynamic-group platform-vm-vault-dg to use keys in
+tenancy where target.key.id = '<key OCID de arriba>'`). Verificado en
+vivo antes y después: con la config completa, el contenedor fallaba con
+`NotAuthorizedOrNotFound` (confirmando que no era un problema de
+red/IMDS); tras crear el Dynamic Group/Policy, la propagación de IAM de
+OCI tardó unos 3 minutos en volverse consistente (varios reintentos
+alternaron entre éxito y `NotAuthorizedOrNotFound` mientras propagaba
+entre réplicas -- comportamiento esperado de IAM eventual-consistency,
+no un error de configuración), y luego quedó estable.
 
 ### Hallazgo real: `/vault/data` vs `/vault/file` en la imagen oficial
 
@@ -800,6 +796,60 @@ root): usar `/vault/file` como `path` del storage `raft` -- es la ruta
 que el propio entrypoint ya sabe preparar. Verificado en vivo: con este
 cambio el contenedor deja de fallar por permisos y llega hasta el paso
 de auto-unseal (ver bloqueo de arriba).
+
+### Hallazgo real (más grave): `cluster_addr` NO puede reusar el puerto de `api_addr`, ni en single-node
+
+Con el Dynamic Group/Policy ya resueltos, Vault seguía sin levantar --
+el contenedor entraba y salía de `Restarting` sin ningún mensaje de
+error, ni siquiera con `VAULT_LOG_LEVEL=trace`. El log se detenía justo
+después de `incrementing seal generation: generation=1` (la validación
+del seal, que sí pasaba) y el proceso terminaba con exit code 1, sin
+imprimir el banner `==> Vault server configuration:` que normalmente
+aparece antes de eso.
+
+Aislado por descarte, comparando contra `vault server -dev` (que sí
+arrancaba limpio) y quitando/regresando cada bloque del `vault.hcl` uno
+a la vez:
+- No era el seal -- se probó también con el Shamir por default (sin
+  bloque `seal "ocikms"`) y fallaba exactamente igual.
+- No era permisos/raft storage -- `vault.db` se escribía bien, sin
+  errores de storage.
+- Quitar `api_addr`/`cluster_addr` por completo sí producía un error
+  explícito y claro: `Cluster address must be set when using raft
+  storage` -- la primera pista real.
+- **Causa real**: `cluster_addr` apuntaba al mismo puerto que
+  `api_addr` (`http://vault:8200` para ambos). El storage `raft`
+  **siempre** necesita su propio transporte TCP de cluster, incluso en
+  single-node sin ningún otro nodo con quien hablar todavía -- si
+  `cluster_addr` reusa el puerto del listener HTTP, el transporte de
+  Raft falla al inicializarse **sin ningún mensaje de error**
+  (comportamiento no documentado con claridad, ni siquiera con
+  trace-level logging -- candidato real a bug/gap de UX de Vault, no
+  solo un error de nuestra config).
+- **Fix real**: `cluster_addr = "http://vault:8201"` (puerto distinto
+  al de `api_addr`) -- Vault deriva el listener de cluster
+  automáticamente del mismo bloque `listener "tcp"` en
+  `address_ip:puerto+1`, no hace falta un segundo `listener` explícito.
+  Puerto 8201 agregado como `expose` (solo entre contenedores de
+  `vm-infra`, nunca publicado al host) en
+  `deploy/vm-infra/vault/docker-compose.yml`.
+
+Verificado en vivo tras el fix: `docker compose up -d` deja el
+contenedor en `Up` (no `Restarting`), `vault status` responde con `Seal
+Type: ocikms`, `Initialized: false`, `Sealed: true` -- exactamente el
+estado esperado de un Vault recién levantado, auto-unseal funcionando,
+pendiente de `vault operator init`.
+
+**Nota para el equipo (regla de mejora continua)**: este es exactamente
+el tipo de gotcha real que vale la pena convertir en chequeo -- si en el
+futuro se agrega otro servicio con storage `raft` (poco probable fuera
+de Vault, pero por si acaso) o se toca este `vault.hcl` de nuevo, un
+lint/hook simple que verifique que `cluster_addr` y `api_addr` no
+comparten puerto evitaría repetir esta sesión de debugging de ~40
+minutos. No se implementa un hook dedicado ahora mismo (es una
+configuración que no cambia con frecuencia una vez estable) -- señalado
+aquí para que Marco decida si vale la pena sumarlo a
+`dev-org-hooks-suite`.
 
 ### Vault 2.0 (Community Edition) -- versión, no OSS "clásico"
 
@@ -829,23 +879,114 @@ definición pide UI pública de Vault. Mismo modelo de confianza que
 Jenkins↔SonarQube (HTTP plano sobre `vm-infra`, sin TLS) -- no es una
 categoría de riesgo nueva para esta VM.
 
-### Pendiente para cerrar este ticket (bloqueado en la acción de arriba)
+### `vault operator init` -- token root + recovery keys (2026-09-01)
 
-- `vault operator init` (genera el token root inicial + las recovery
-  keys de respaldo -- con auto-unseal vía KMS, Vault usa recovery keys
-  Shamir en vez de unseal keys Shamir tradicionales; cumplen el mismo
-  rol de respaldo manual que pide HU-2) y entrega a Marco para su
-  gestor de contraseñas.
-- Habilitar el motor Transit + crear la llave `auth-core-mc-tenant-keys`,
-  probado con `vault write transit/encrypt/...` real.
+`vault operator init -recovery-shares=3 -recovery-threshold=2` (con
+auto-unseal vía KMS, Vault genera **recovery keys** Shamir en vez de
+unseal keys tradicionales -- cumplen el mismo rol de respaldo manual
+que pide HU-2, ver la prueba real más abajo). 3 shares / threshold 2:
+suficiente margen si Marco pierde acceso a una entrada de su gestor de
+contraseñas, sin complicar de más el guardado para un equipo de una
+persona.
+
+**Manejo del secreto -- nunca expuesto en este chat ni en la salida de
+ningún comando que este agente haya visto**: la salida completa de
+`vault operator init` (token root + las 3 recovery keys) se redirigió
+directo a un archivo en la VM,
+`/home/ubuntu/secrets/vault/init-output.json` (permisos `600`, dueño
+`ubuntu`) -- este agente nunca hizo `cat`/leyó ese archivo, todos los
+pasos posteriores que necesitaron el token (habilitar Transit, probar
+las recovery keys) lo leyeron **dentro de un script que corrió en la
+propia VM**, sin que el valor viajara de vuelta a este chat.
+
+**Acción pendiente de Marco (no bloqueante para seguir con 004-006,
+pero sí para terminar de cerrar el ticket 003)**: recuperar ese archivo
+y guardar su contenido en su gestor de contraseñas, luego borrarlo de
+la VM. Un comando (SSH a la VM, ver el archivo, copiar los valores a
+mano):
+
+```bash
+ssh ampere-free "cat /home/ubuntu/secrets/vault/init-output.json"
+```
+
+Y una vez guardado en el gestor de contraseñas, borrarlo de la VM:
+
+```bash
+ssh ampere-free "shred -u /home/ubuntu/secrets/vault/init-output.json"
+```
+
+### Motor Transit -- habilitado y probado de verdad (2026-09-01)
+
+`transit/` habilitado, llave `auth-core-mc-tenant-keys` creada
+(`aes256-gcm96`, la que `VAULT_TRANSIT_KEY_NAME` ya espera en
+`auth-core-mc`). Prueba real de round-trip (`transit/encrypt` seguido
+de `transit/decrypt` sobre un valor de prueba conocido,
+`ticket-003-transit-smoke-test`) -- confirmado que el texto descifrado
+coincide exactamente con el original. Sin conectar ningún consumidor
+real todavía (eso es el ticket 005) -- esta prueba usó el token root
+solo para la verificación puntual del motor mismo, nunca quedó
+conectada como mecanismo de acceso permanente.
+
+Codificado como paso idempotente de `sync-vm-infra`
+(`.github/workflows/ci.yml`, "Asegurar motor Transit + llave
+auth-core-mc-tenant-keys en Vault") -- no solo "corrió una vez a mano":
+lee el token root del mismo archivo de arriba, se omite con un aviso
+explícito (no falla el pipeline) si Vault todavía no tiene `operator
+init` corrido o sigue sellado.
+
+### Recovery keys -- probadas de verdad, no solo generadas (2026-09-01)
+
+HU-2, segundo criterio ("Marco puede desellar manualmente... probado al
+menos una vez de verdad, no solo teórico"). Con auto-unseal KMS, las
+recovery keys NO se usan con `vault operator unseal` directo (ese
+comando es para el flujo Shamir clásico) -- su mecanismo real de
+recuperación es `vault operator generate-root`, el procedimiento que
+HashiCorp documenta para regenerar acceso administrativo usando
+recovery keys. Prueba real ejecutada (dentro de un script en la propia
+VM, igual que arriba -- ninguna key ni token pasó por este chat):
+
+1. `vault operator generate-root -init` -- genera nonce + OTP.
+2. Se aportaron 2 de las 3 recovery keys (threshold=2) vía `vault
+   operator generate-root -nonce=... <key>`.
+3. `complete: true` tras la 2a key -- confirma que 2 de 3 alcanza.
+4. Se decodificó el token resultante con el OTP.
+5. **Se confirmó que el token nuevo autentica de verdad** contra Vault
+   (`vault token lookup` con ese token devolvió `policies: ["root"]`).
+6. Se revocó el token nuevo inmediatamente (`vault token revoke -self`)
+   -- era solo para la prueba, no se dejó una segunda credencial root
+   viva.
+
+No se probó el escenario más extremo (OCI KMS realmente inalcanzable +
+arranque en Recovery Mode) -- señalado explícitamente como no cubierto,
+no como "ya probado": esa prueba implica un procedimiento de arranque
+distinto y más invasivo (`vault server -recovery`), con más riesgo para
+una instancia que ya tiene el motor Transit configurado, y no era
+necesaria para demostrar que las recovery keys en sí son válidas y
+funcionales, que es lo que HU-2 pide. Si Marco quiere esa prueba más
+extrema también, es un paso aparte, no incluido aquí.
+
+### `docker stats` en reposo (2026-09-01)
+
+```
+CONTAINER   CPU %    MEM USAGE / LIMIT     MEM %
+vault       0.31%    35.52MiB / 23.41GiB   0.15%
+```
+
+Huella mínima, muy por debajo de cualquier preocupación de recursos en
+esta VM (4 OCPU/24GB, ver ticket 002) -- consistente con lo esperado
+para Vault en reposo, sin tráfico real todavía (ningún consumidor
+conectado hasta el ticket 004/005).
+
+### Pendiente para cerrar este ticket
+
 - Reinicio real de la VM (bloqueado para este agente, exclusivo de
-  Marco) para verificar HU-2 de punta a punta -- comando exacto se
-  entrega junto con el resto del cierre de este ticket.
-- Prueba real de desellado manual con las recovery keys (simulando que
-  OCI KMS no está disponible).
-- `docker stats` de Vault en reposo, con número real (no estimado).
-- Extender `sync-vm-infra` -- **ya hecho** en este mismo commit
-  (`.github/workflows/ci.yml`), pendiente de verificar en verde una vez
-  que el paso de arriba deje de fallar (ahora mismo fallaría en CI igual
-  que en la prueba manual, por el mismo `NotAuthorizedOrNotFound`).
+  Marco) para verificar HU-2 de punta a punta (auto-unseal sobreviviendo
+  un reboot real, no solo un restart de contenedor) -- **comando exacto
+  pendiente de pedir a Marco cuando el resto de este ticket esté listo
+  para esa verificación final.**
+- Que Marco recupere y guarde el token root + recovery keys de su
+  gestor de contraseñas (ver arriba) y borre el archivo de la VM.
+- Verificar `sync-vm-infra` en verde en un push real (el workflow ya
+  quedó actualizado, pendiente de confirmarse en un run real de GitHub
+  Actions, no solo localmente).
 

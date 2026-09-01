@@ -67,7 +67,24 @@ disable_mlock = true
 # Nombre de servicio Docker ("vault"), no localhost ni IP -- mismo patrón
 # que "sonarqube:9000"/"jenkins:8080" en el resto de esta infra (los
 # contenedores se resuelven por nombre en la red "vm-infra").
+#
+# Hallazgo real (ticket 003, verificado en vivo): cluster_addr NO puede
+# usar el mismo puerto que api_addr, ni siquiera en single-node -- el
+# storage "raft" siempre necesita su propio transporte TCP de cluster
+# (aunque no haya ningún otro nodo con quien hablar todavía), y si
+# cluster_addr apunta al mismo puerto que ya usa el listener HTTP, el
+# transporte de Raft falla al arrancar SIN NINGÚN mensaje de error (ni
+# siquiera con log_level=trace) -- el proceso simplemente termina un
+# instante después de "incrementing seal generation", banner de
+# configuración incluido nunca llega a imprimirse. Aislado comparando
+# contra `vault server -dev` (que sí muestra el banner completo) y
+# quitando/regresando cada bloque del config uno a la vez -- confirmado
+# que NI SIQUIERA el seal (se probó también sin "ocikms", con el Shamir
+# por default) era la causa; el fix real fue separar los puertos. Vault
+# deriva el listener de cluster automáticamente del mismo bloque
+# "listener \"tcp\"" en address_ip:puerto+1 (8201) -- no hace falta un
+# segundo "listener" explícito, solo que cluster_addr apunte ahí.
 api_addr     = "http://vault:8200"
-cluster_addr = "http://vault:8200"
+cluster_addr = "http://vault:8201"
 
 log_level = "info"

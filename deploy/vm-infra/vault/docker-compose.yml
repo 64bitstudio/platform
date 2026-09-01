@@ -43,6 +43,17 @@ services:
       # 127.0.0.1: acceso administrativo de Marco vía SSH a la VM (CLI de
       # vault o un túnel), nunca expuesto directo a internet.
       - "127.0.0.1:8200:8200"
+    expose:
+      # Puerto de cluster de Raft (ver vault.hcl, cluster_addr) -- SOLO
+      # entre contenedores de la misma red, nunca publicado al host ni a
+      # internet. No hace falta esto para que otros contenedores de
+      # "vm-infra" lo alcancen (Docker ya permite tráfico entre
+      # contenedores de la misma red sin publicar el puerto) -- se deja
+      # explícito solo por documentación, para que quede claro que este
+      # puerto existe y por qué (single-node hoy, pero Raft siempre
+      # necesita su propio transporte de cluster, ver el hallazgo real en
+      # vault.hcl).
+      - "8201"
     networks:
       - default
       - vm-infra
