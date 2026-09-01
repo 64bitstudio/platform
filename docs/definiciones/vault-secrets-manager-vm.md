@@ -45,11 +45,25 @@ de error humano y ningún rastro auditable — reemplazándolo por una
 fuente única, versionada en su historial de acceso, con rotación
 posible sin tocar archivos a mano.
 
+**Reformulado 2026-09-01 — hallazgo real, no solo higiene**: al
+verificar el estado actual se confirmó (sin exponer valores,
+`length()>0` sobre los `.env` reales) que `VAULT_ADDR`/`VAULT_ROOT_TOKEN`
+están **vacíos hoy en DEV, QA y PROD** de `auth-core-mc` — el propio
+código lo advierte: *"Vacío = TenantIdentityProviderService fallará
+ruidosamente si algún tenant intenta configurar un secreto social"*
+(pregunta abierta desde el ticket 049, nunca resuelta). Es decir: el
+motor Transit de cifrado de secretos de tenant (ticket 017) **no está
+conectado a ningún Vault real en ningún ambiente desplegado hoy** — no
+es un riesgo teórico, es una funcionalidad rota en este momento. Marco
+confirmó (2026-09-01) que este mismo Vault de infra debe resolver
+también ese hueco — un solo Vault, no dos.
+
 ### Usuarios y roles involucrados
 | Rol | Qué hace en este cambio |
 |---|---|
 | **Marco (operador único)** | Único humano con acceso de administrador a Vault; ejecuta la migración y el resize; guarda el respaldo manual de unseal keys en su gestor de contraseñas. |
 | **Jenkins (pipeline)** | Consumidor automatizado — se autentica vía AppRole, lee solo los secretos de su política (least privilege), nunca el árbol completo. |
+| **Backend de `auth-core-mc` (y futuros cores que lo necesiten)** | Consumidor automatizado nuevo, en tiempo de ejecución (no solo deploy): llama al motor Transit de Vault para cifrar/descifrar secretos de tenant. Su propia AppRole, distinta de la de Jenkins — el `SecretID` se inyecta como env var al deploy, mismo mecanismo que ya usa `DB_PASSWORD` hoy. |
 | **GitHub Actions (`sync-vm-infra`)** | Consumidor automatizado — hoy usa GitHub Actions Secrets; queda como pregunta abierta si también migra a leer de Vault (ver más abajo) o se queda como está. |
 
 No hay roles humanos nuevos — sigue siendo un equipo de una persona.
@@ -80,6 +94,22 @@ No hay roles humanos nuevos — sigue siendo un equipo de una persona.
   del Basic Auth de nginx (`/etc/nginx/secrets/vm-admin-tools.htpasswd`)
   — uno a la vez, empezando por DEV de `auth-core-mc` (el de menor
   riesgo), verificando cada paso antes de seguir.
+- **Motor Transit de Vault, habilitado desde el día uno** (no es un
+  KV genérico solamente) — resuelve el hueco real de hoy: conectar
+  `VAULT_ADDR`/`VAULT_ROOT_TOKEN` (vacíos actualmente en DEV/QA/PROD)
+  a este mismo Vault, con la clave `auth-core-mc-tenant-keys` ya
+  esperada por el código. AppRole propia para el backend de
+  `auth-core-mc` (distinta de la de Jenkins), inyectada como env var al
+  deploy.
+- **PAT de GitHub nuevo y acotado para Jenkins/CI**, generado y guardado
+  en Vault en el mismo esfuerzo — reemplaza al PAT compartido actual
+  (que tiene permisos de administrador y puede saltarse branch
+  protection, hallazgo real del ticket 002). Scope mínimo necesario
+  (checkout, webhook, push a ramas de despliegue), sin permisos de
+  admin/owner.
+- **Alerta por Telegram si Vault queda sellado/inalcanzable** (mismo
+  canal/bot que ya usa el pipeline) — para enterarse antes de que un
+  deploy falle, no después.
 - Respaldo manual de las unseal keys (Shamir) en el gestor de
   contraseñas de Marco, como red de seguridad si el auto-unseal de OCI
   KMS llegara a fallar.
@@ -90,11 +120,14 @@ No hay roles humanos nuevos — sigue siendo un equipo de una persona.
 - Autenticación de GitHub Actions vía OIDC contra Vault (eliminar
   GitHub Actions Secrets por completo) — se deja como HU *stretch*,
   fuera del alcance obligatorio de la primera versión (ver HU-6).
-- Fusionar este Vault con el que ya existe en la Mac de Marco (motor
-  Transit para cifrado por sobres de `auth-core-mc`, ticket 017) — son
-  instancias **separadas**, propósitos distintos. Queda como pregunta
-  abierta si eso se revisa más adelante (ver "Riesgos y preguntas
-  abiertas").
+- **Retirar o migrar el Vault que ya existe en la Mac de Marco**
+  (`~/dev-infra`) — sigue existiendo, para uso puramente local
+  (desarrollo/pruebas en su propia máquina). Lo que SÍ cambia: deja de
+  ser (o de estar pensado para ser) lo que sirve Transit a los
+  ambientes reales desplegados — eso pasa a ser exclusivamente el Vault
+  de la VM, resolviendo el hueco de HU-7. Retirar el de la Mac por
+  completo queda como decisión aparte, futura, no parte de este
+  documento.
 - Alta disponibilidad real (múltiples nodos de Vault) — sigue siendo
   single-node; el diseño con Raft lo deja preparado para eso, pero no
   se implementa ahora.
@@ -106,12 +139,6 @@ No hay roles humanos nuevos — sigue siendo un equipo de una persona.
 - Vault gestionando su propia credencial de acceso humano (login de
   Jenkins vía UI, por ejemplo) — eso sigue siendo gestión local de cada
   herramienta, como ya se decidió para Jenkins en el ticket 049.
-- **Acotar los permisos del PAT de GitHub compartido** (hallazgo real
-  del ticket 002: puede saltarse branch protection) — es un cambio
-  relacionado pero independiente, ya anotado como candidato a ticket
-  futuro aparte; este documento no lo resuelve, aunque Vault sí sería
-  el lugar natural para guardar un PAT nuevo y acotado el día que se
-  cree.
 
 ## Historias de Usuario
 
@@ -209,6 +236,49 @@ Criterios de aceptación:
 - **No implementar en la primera versión** — solo evaluar si vale la
   pena una vez que Vault ya esté estable con Jenkins.
 
+### HU-7 (sumada 2026-09-01): Login social funciona de verdad en todos los ambientes
+Como tenant de `auth-core-mc`, quiero poder configurar mis credenciales
+de login social (Google/Facebook) en cualquier ambiente, para que la
+funcionalidad no falle silenciosamente por falta de un Vault real
+conectado.
+
+Criterios de aceptación:
+- Dado el motor Transit habilitado en el Vault de la VM, cuando un
+  tenant configura un `client_secret` social en DEV, QA o PROD,
+  entonces se cifra/descifra correctamente — sin el error ruidoso que
+  hoy produce `TenantIdentityProviderService` con `VAULT_ADDR` vacío.
+- Dado el backend de `auth-core-mc`, cuando arranca en cualquier
+  ambiente, entonces se autentica contra Vault con su propia AppRole
+  (no la de Jenkins) — inyectada al deploy igual que `DB_PASSWORD` hoy.
+- Dado que el `SecretID` de esta AppRole se filtrara, entonces el daño
+  queda acotado a operaciones de Transit sobre las claves de
+  `auth-core-mc` — no al resto de Vault.
+
+### HU-8 (sumada 2026-09-01): Alerta si Vault queda inalcanzable
+Como operador único, quiero enterarme por Telegram si Vault queda
+sellado/inalcanzable, para no descubrirlo hasta que un deploy falle.
+
+Criterios de aceptación:
+- Dado que un healthcheck periódico (o el propio intento de un
+  pipeline) detecta que Vault no responde o está sellado, entonces se
+  envía una alerta real por Telegram (mismo bot/canal que ya usa el
+  pipeline), con suficiente contexto para actuar sin tener que
+  investigar desde cero.
+
+### HU-9 (sumada 2026-09-01): PAT de GitHub acotado, guardado en Vault
+Como operador, quiero que Jenkins/CI usen un PAT de GitHub con el
+mínimo privilegio necesario, para que un error de proceso (como el
+push directo del ticket 002) no pueda saltarse branch protection.
+
+Criterios de aceptación:
+- Dado un PAT nuevo, generado con scope mínimo (checkout, webhook, push
+  a ramas de despliegue — sin permisos de administrador/owner del
+  repo), cuando se guarda en Vault y se conecta a Jenkins, entonces
+  reemplaza al PAT compartido actual.
+- Dado un intento de push directo a una rama protegida usando ese PAT
+  nuevo, entonces GitHub lo rechaza (a diferencia de hoy, que lo
+  permite con un aviso de "bypass").
+
 ## Diseño técnico
 
 **Vault OSS, contenedor Docker, storage backend Raft (single-node).**
@@ -247,33 +317,64 @@ se sigue renderizando como archivo en `/etc/nginx/secrets/` durante el
 job `sync-vm-infra`, pero su valor de origen pasa a leerse de Vault en
 ese mismo paso, no generarse ahí mismo como hoy.
 
+**Motor Transit habilitado desde la instalación inicial** (no un paso
+posterior) — es lo que resuelve HU-7. Clave `auth-core-mc-tenant-keys`
+(el nombre que el código ya espera vía `VAULT_TRANSIT_KEY_NAME`), con
+una policy de Transit dedicada (`encrypt`/`decrypt` sobre esa clave
+únicamente, no administración del motor) para la AppRole del backend.
+El Vault de la Mac (`~/dev-infra`) sigue existiendo para desarrollo
+local — no se retira, pero deja de ser (o de estar pensado para ser) lo
+que sirve a los ambientes reales.
+
+**PAT de GitHub nuevo y acotado (HU-9)**: se genera con el scope mínimo
+real que Jenkins necesita (confirmar exactamente cuáles al implementar
+— probablemente `contents:write`, `metadata:read`, `webhooks:write` a
+nivel fine-grained, sin `administration`), se guarda en Vault, y
+reemplaza al PAT compartido actual en el credential store de Jenkins.
+No elimina la necesidad de que exista un PAT (alguien tiene que poder
+hacer checkout/push), pero sí el radio de daño de un error como el del
+ticket 002.
+
+**Alerta de Vault sellado (HU-8)**: el mecanismo más simple y
+consistente con lo ya construido es que el propio job `sync-vm-infra`
+(que ya corre en cada push) verifique el estado de sello de Vault
+(`vault status`) y dispare la misma notificación de Telegram que ya usa
+para éxito/fallo del pipeline — sin sumar un proceso de monitoreo
+nuevo y separado.
+
 ## Diagramas
 
 ```mermaid
 flowchart TB
     subgraph VM["VM OCI Ampere A1 (4 OCPU/24GB, ya redimensionada)"]
-        Vault["Vault OSS<br/>Raft single-node"]
+        Vault["Vault OSS<br/>Raft single-node<br/>+ motor Transit"]
         KMS["OCI KMS<br/>(auto-unseal)"]
         Jenkins["Jenkins<br/>(1 solo, org-wide)"]
         Lib["Shared Library<br/>vars/corePipeline.groovy"]
         Nginx["nginx<br/>(Basic Auth de infra)"]
         Apps["Stacks dev/qa/prod<br/>de CUALQUIER core<br/>(auth-core-mc, mail-core-mc, futuros)"]
+        AuthBackend["Backend auth-core-mc<br/>(en ejecución, no solo deploy)"]
 
         Vault -- "auto-unseal al arrancar" --> KMS
         Jenkins -- "invoca" --> Lib
-        Lib -- "AppRole (RoleID + SecretID)" --> Vault
+        Lib -- "AppRole infra (RoleID + SecretID)" --> Vault
         Lib -- "inyecta DB_PASSWORD/PAT/tokens<br/>en tiempo de deploy" --> Apps
         Lib -- "renderiza .htpasswd<br/>vía certbotDomains" --> Nginx
+        Lib -- "verifica sello, alerta si falla" --> Vault
+        AuthBackend -- "AppRole propia<br/>encrypt/decrypt Transit" --> Vault
     end
 
     GHA["GitHub Actions<br/>(sync-vm-infra, repo platform)"] -- "GitHub Actions Secrets<br/>(sin cambio en v1, ver HU-6)" --> Jenkins
     Marco["Marco<br/>(único operador)"] -- "unseal keys de respaldo<br/>(gestor de contraseñas)" -.-> Vault
+    TG["Telegram<br/>(mismo bot del pipeline)"]
+    Lib -.->|"si Vault está sellado"| TG
 ```
 Muestra que la integración vive en la Shared Library, no en el
 `Jenkinsfile` de cada core — cualquier core que ya la use (todos, desde
-el ticket 002) hereda Vault automáticamente. GitHub Actions sigue sin
-cambio en v1 (ver HU-6), y Marco solo entra como respaldo manual del
-unseal.
+el ticket 002) hereda Vault automáticamente. El backend de
+`auth-core-mc` es un consumidor aparte, en tiempo de ejecución, con su
+propia AppRole para Transit. GitHub Actions sigue sin cambio en v1
+(ver HU-6), y Marco solo entra como respaldo manual del unseal.
 
 ```mermaid
 sequenceDiagram
@@ -300,11 +401,12 @@ sin credenciales de larga duración quedando en el runner entre builds.
   que no quedó aislado si el resize por sí solo hubiera necesitado
   reinicio o no — irrelevante ya para este documento, el resize está
   hecho de cualquier forma.
-- **¿Se fusiona este Vault con el de la Mac (Transit, ticket 017) más
-  adelante, o quedan separados para siempre?** Sigue sin resolver —
-  este documento sigue asumiendo separados (propósitos distintos: uno
-  es cifrado por sobres de datos de aplicación, el otro es secrets
-  manager de infra). Marco debe confirmarlo.
+- ~~¿Se fusiona este Vault con el de la Mac más adelante?~~ **Resuelto
+  parcialmente (2026-09-01)**: el Vault de la VM pasa a ser el que
+  sirve Transit a los ambientes reales (HU-7) — el de la Mac sigue
+  existiendo, pero solo para desarrollo local. Queda abierto si algún
+  día se retira el de la Mac por completo; no bloquea nada de este
+  documento.
 - **Memoria/CPU real de Vault en reposo**, no medida todavía — se mide
   como parte de la implementación. Con la VM ya en 4 OCPU/24GB (el
   doble que cuando se escribió la primera versión de este documento),
@@ -320,26 +422,35 @@ sin credenciales de larga duración quedando en el runner entre builds.
   incluya una alerta (Telegram, mismo canal que ya usa el pipeline) si
   Vault queda sellado/inalcanzable, para no descubrirlo hasta que un
   deploy falle.
-- **El PAT compartido de GitHub sigue siendo un secreto de alto
-  privilegio guardado fuera de Vault** (bootstrap de Jenkins, credential
-  store de la UI) — coherente con el diseño (alguien tiene que arrancar
-  la cadena de confianza, ver HU-3), pero el hallazgo del ticket 002
-  (ese mismo PAT puede saltarse branch protection) hace más urgente,
-  no menos, acotarlo — ver el ticket futuro ya anotado en "No incluye".
+- **El PAT nuevo y acotado (HU-9) sigue siendo, por diseño, la única
+  credencial que arranca la cadena de confianza** — vive en el
+  credential store de Jenkins (UI), no en Vault, por el mismo motivo
+  que el `SecretID` inicial de la AppRole de Jenkins (HU-3): algo tiene
+  que existir fuera de Vault para poder autenticarse contra él la
+  primera vez. Ya no es el PAT de admin/owner actual (eso es
+  precisamente lo que HU-9 corrige), así que el radio de daño de que
+  se filtre es mucho menor.
 
 ## Impacto estimado (tickets tentativos)
 El resize (HU-5, antes "Ticket A") ya está hecho — fuera de esta lista.
 Siguientes tickets, en `platform` (numeración real siguiente: 003+):
 
 - Ticket `platform/003`: Instalación de Vault (Raft, auto-unseal OCI
-  KMS) — sin migrar nada todavía, solo la infra base + medición de
-  recursos (HU-1 parcial, HU-2).
-- Ticket `platform/004`: AppRole integrado en `vars/corePipeline.groovy`
-  + migración de secretos, ambiente por ambiente, empezando por DEV de
-  `auth-core-mc` (HU-1 completa, HU-3, HU-4).
-- Ticket `platform/005` (stretch, no obligatorio): OIDC de GitHub
-  Actions (HU-6) — solo si se decide perseguir después de que 004 esté
-  estable.
+  KMS, motor Transit habilitado desde el inicio) — sin migrar nada
+  todavía, solo la infra base + medición de recursos (HU-1 parcial,
+  HU-2, prerrequisito de HU-7).
+- Ticket `platform/004`: AppRole de Jenkins integrada en
+  `vars/corePipeline.groovy` + migración de secretos de infra, ambiente
+  por ambiente, empezando por DEV de `auth-core-mc` (HU-1 completa,
+  HU-3, HU-4) + alerta de Telegram si Vault se sella (HU-8).
+- Ticket `platform/005`: AppRole propia del backend de `auth-core-mc`
+  para Transit — conecta `VAULT_ADDR`/`VAULT_ROOT_TOKEN` en DEV/QA/PROD,
+  arregla el login social roto hoy (HU-7).
+- Ticket `platform/006`: PAT de GitHub nuevo y acotado, guardado en
+  Vault, reemplaza al compartido actual (HU-9).
+- Ticket `platform/007` (stretch, no obligatorio): OIDC de GitHub
+  Actions (HU-6) — solo si se decide perseguir después de que los
+  anteriores estén estables.
 
 Se refinan a tickets reales (`nuevo-ticket`) después del VoBo de Marco
 sobre este documento.
@@ -359,3 +470,16 @@ sobre este documento.
 - Los paths de secretos y nombres de archivo se actualizaron contra lo
   que hoy existe de verdad en `platform` (no lo que existía cuando se
   escribió la primera versión, antes de la migración a este repo).
+
+**Segunda ronda (2026-09-01, misma fecha, tras aclarar riesgos y
+preguntas abiertas antes del VoBo):**
+- Hallazgo real verificado: `VAULT_ADDR`/`VAULT_ROOT_TOKEN` vacíos hoy
+  en DEV/QA/PROD — el login social de `auth-core-mc` está roto en este
+  momento, no es un riesgo teórico. Motiva HU-7, sumada al alcance.
+- El motor Transit se suma al alcance obligatorio desde el día uno —
+  ya no es "fusionar Vaults" como pregunta abierta, es que el Vault de
+  la VM pasa a servir Transit a los ambientes reales (el de la Mac
+  sigue existiendo, solo para desarrollo local).
+- Alerta de Telegram si Vault se sella, sumada al alcance (HU-8).
+- PAT de GitHub nuevo y acotado, sumado al alcance de este mismo
+  esfuerzo en vez de quedar como ticket futuro aparte (HU-9).
