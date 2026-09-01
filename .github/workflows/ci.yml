@@ -292,6 +292,19 @@ jobs:
             echo "$NEW_HASH" > "$HASH_FILE"
           fi
 
+      # Ticket 002 (fix real, 2026-09-01): imagen que la Shared Library
+      # usa (vía docker.sock) para ejecutar comandos en el namespace del
+      # HOST desde un paso de pipeline de Jenkins -- necesario porque
+      # Jenkins mismo corre containerizado y no tiene acceso directo a
+      # /etc/nginx ni al systemd reales de la VM (ver comentario completo
+      # en deploy/vm-infra/jenkins/host-exec/Dockerfile). Build local, sin
+      # cache-check dedicado (la imagen es mínima, "docker build" con
+      # cache de capas ya la vuelve prácticamente gratis cuando no
+      # cambió) -- no hay contenedor de larga vida que recrear, así que
+      # el riesgo del punto 1 no aplica aquí.
+      - name: Imagen "host-exec" (nsenter hacia el host, para pasos de pipeline que lo necesiten)
+        run: docker build -t platform-host-exec:latest deploy/vm-infra/jenkins/host-exec
+
       # El step "Quality Gate" del Jenkinsfile de cada core
       # (waitForQualityGate()) necesita que SonarQube avise a Jenkins
       # cuando termina un análisis -- eso es un webhook configurado DEL
