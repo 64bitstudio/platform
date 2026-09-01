@@ -65,3 +65,4 @@ cerrado) para el resultado exacto (estado de `docker ps` en la VM,
 jobs de Jenkins, usuario `marco` en SonarQube, respuesta real de los 4
 subdominios, y confirmación de que un push solo-`docs/` no disparó el
 workflow)._
+
