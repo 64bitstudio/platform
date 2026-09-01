@@ -87,12 +87,6 @@ services:
       - "traefik.http.routers.jenkins.rule=Host(`jenkins.64bitstudio.com`)"
       - "traefik.http.routers.jenkins.entrypoints=web"
       - "traefik.http.services.jenkins.loadbalancer.server.port=8080"
-      # Label sin efecto real, solo para forzar un cambio genuino en la
-      # config resuelta del servicio (garantiza que "docker compose up -d"
-      # recree el contenedor pase lo que pase con el cache de build de la
-      # imagen) -- usado para verificar en vivo el punto 1 del ticket 002.
-      # Ver docs/ARQUITECTURA.md para la evidencia de esta verificación.
-      - "platform.ticket002.verificacion=2"
 
 networks:
   edge:
