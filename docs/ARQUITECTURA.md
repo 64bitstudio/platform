@@ -1363,19 +1363,49 @@ borrados (`shred -u`) al terminar.
 propósito** (no se borraron) -- reutilizables para verificaciones
 futuras, mismo criterio que `qa-visual-031@example.com` en ticket 031.
 
-### Pendiente: QA y PROD
+### QA -- verificado real, misma evidencia que DEV (2026-09-01)
+
+`dev` -> `qa` de `auth-core-mc` promovido por el orquestador (push
+directo, `qa` estaba muy atrasado desde antes del rediseño de ramas --
+resuelto con conflictos reales, sin perder contenido: `qa` solo tenía 2
+commits viejos de promoción sin contenido único). Deploy real
+verificado (build #1 de la rama `qa`, commit `5c6cf78`):
+
+- `QA healthy.` -- healthcheck real en verde.
+- `VAULT_ADDR`/`VAULT_ROLE_ID`/`VAULT_SECRET_ID` confirmados con
+  valores reales en `/home/ubuntu/secrets/auth-core-mc/.env.qa`
+  (`mtime` coincidente con la ventana del deploy).
+- Cero ocurrencias de `X-Vault-Token` en el log -- el fix de `set +x`
+  sigue sosteniéndose.
+- Pipeline correctamente pausado en `¿Promover a PROD?` (`input` step,
+  hasta 7 días) -- el gate manual funciona como se diseñó.
+
+**Verificación end-to-end real en QA** (mismo procedimiento que DEV,
+base de datos separada -- confirmado vacía antes de empezar, igual que
+DEV): tenant + `IdentityClient` de prueba (`ticket-005-e2e-verification`
+/ `ticket-005-e2e-client`), registro real, una escritura directa para
+promover a `TENANT_ADMIN`, login real, `PUT
+/api/v1/admin/identity-providers/GOOGLE` real -> **`HTTP 200`**.
+Confirmado en la base real de QA: `client_secret_encrypted` con
+ciphertext real (`OlEDIg+IGRkU5/v5CYsADSNo6HkG7dmbGeu43wE3...`, 100
+caracteres, distinto del de DEV como se espera -- data-key y ciphertext
+son por-tenant) -- no el secreto en texto plano. Mismo razonamiento que
+en DEV: ese único `HTTP 200` ya prueba `wrap` y `unwrap` contra el
+Vault real, vía la AppRole `auth-core-mc-backend`, en QA.
+
+Tenant/usuario de prueba de QA dejados a propósito, mismo criterio que
+DEV. Tokens/respuestas HTTP con JWT nunca persistidos (`shred -u` al
+terminar).
+
+### Pendiente: PROD
 
 Criterio de aceptación del ticket ("probado de verdad en los tres
-ambientes, no asumido por similitud con DEV") -- **no se da por
-cumplido en QA/PROD todavía**, señalado explícitamente, no asumido.
-Bloqueado en dos acciones exclusivas de Marco (ver el mensaje
-correspondiente en el hilo de la sesión para el detalle completo):
-
-1. Promover `dev` -> `qa` de `auth-core-mc` (dispara el deploy
-   automático a QA) -- exclusivo de Marco, no una decisión ni una
-   acción de este agente.
-2. Tras verificar QA, aprobar el gate manual de PROD en la propia UI de
-   Jenkins (`input` step, `submitter: 'marco'`, hasta 7 días de
-   espera) -- una acción de clic en la UI, no un comando de terminal;
-   sin credencial de API de Jenkins disponible para este agente (ver
-   ticket 049).
+ambientes") -- **DEV y QA ya verificados con evidencia real, PROD
+sigue pendiente**, señalado explícitamente, no asumido. `qa -> prod`
+es exclusivo de Marco (ni el agente ni el orquestador lo tocan) --
+aprobar el gate manual de PROD requiere entrar a la consola del build
+de Jenkins (`jenkins.64bitstudio.com`, job `auth-core-mc/qa`, build
+más reciente) y hacer clic en "Promover a PROD" -- una acción de UI,
+no un comando de terminal; sin credencial de API de Jenkins disponible
+para el agente (ver ticket 049). El `input` tiene hasta 7 días de
+plazo antes de expirar.
