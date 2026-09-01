@@ -531,6 +531,87 @@ tipo de acción -- lanzar un contenedor con acceso elevado y PID
 compartido con el host -- que merece ese filtro; el diseño en sí lo
 pidió explícitamente el Product Owner al revisar las opciones reales
 disponibles, dado que Jenkins ya tiene `docker.sock` montado). La
-verificación real es el siguiente deploy a `dev` con el fix aplicado --
-ver PRs `platform#6`/`auth-core-mc#84`.
+verificación real fue el siguiente deploy a `dev` (build #9, tras
+mergear `platform#6`/`auth-core-mc#84`) -- **ambos bugs confirmados
+resueltos con evidencia real**:
+
+- Stage "Vhost de nginx (dev)": `nginx: the configuration file
+  /etc/nginx/nginx.conf syntax is ok` / `test is successful` en el log
+  real del build (04:51:00 UTC) -- y `/etc/nginx/sites-available/
+  auth-core-mc.conf` en el HOST con timestamp `Sep 1 04:51`, confirmando
+  que el archivo sí se escribió de verdad en el filesystem real de la
+  VM (no en un contenedor).
+- Healthcheck: `curl http://auth-core-mc-dev-app-1:8080/actuator/health`
+  respondió `"status":"UP"` en el 5º intento (04:51:24), `docker compose
+  ps` confirmó el contenedor `Up ... (healthy)`, publicando
+  `0.0.0.0:8081->8080/tcp` -- build completo `Finished: SUCCESS`.
+
+### Incidente real derivado (2026-09-01): ese mismo deploy rompió HTTPS de auth/auth-qa/auth-dev.64bitstudio.com durante varios minutos
+
+Encontrado al verificar `https://auth-dev.64bitstudio.com` inmediatamente
+después del build #9 exitoso -- `curl` fallaba la validación TLS: "SSL:
+no alternative certificate subject name matches target host name
+'auth-dev.64bitstudio.com'" (nginx serví­a, por fallback, el certificado
+de `jenkins.64bitstudio.com`).
+
+**Causa raíz**: `deploy/vm-infra/nginx/auth-core-mc.conf`, tal como vive
+en git, es deliberadamente la versión SOLO-HTTP -- su propio comentario
+lo dice: "SIN bloque 443/ssl todavía... correr `certbot --nginx -d
+auth...`". El bloque 443/ssl real que servía HTTPS desde antes de este
+ticket lo agregó certbot DIRECTO en el archivo del HOST, a mano, semanas
+atrás (nunca vía ningún pipeline -- ver el punto "Qué NO vive aquí" al
+inicio de este documento: "el certificado... nunca se pidió desde este
+repo") -- y nunca se sincronizó de vuelta a git. El nuevo stage "Vhost de
+nginx (dev)" (recién agregado en el punto 12 de arriba) hizo, por primera
+vez desde que ese certificado existe, un `cp` real que sobreescribió el
+archivo del host con la versión de git -- pisando el bloque 443/ssl.
+
+**Por qué `jenkins.conf`/`vm-admin-tools.conf` nunca sufrieron esto**:
+`ci.yml` (`sync-vm-infra`) SÍ vuelve a correr `certbot --nginx` justo
+después de copiar esos dos archivos, en CADA push -- certbot reconfigura
+el bloque 443/ssl de inmediato después de que el `cp` lo pisa, así que
+el hueco nunca es observable (auto-reparación en el mismo run). El vhost
+de `auth-core-mc.conf` nunca tuvo ese segundo paso en ningún pipeline
+-- su certificado se emitió una sola vez, a mano, fuera de cualquier
+automatización.
+
+**Impacto real**: `auth.64bitstudio.com`, `auth-qa.64bitstudio.com` y
+`auth-dev.64bitstudio.com` comparten el mismo bloque `server` en el
+mismo archivo (`server_name auth.64bitstudio.com auth-qa.64bitstudio.com
+auth-dev.64bitstudio.com`) -- los 3 quedaron con HTTPS roto por igual
+durante el tiempo entre el build #9 (04:51 UTC) y la restauración manual
+(unos minutos después). El certificado en sí, en
+`/etc/letsencrypt/live/auth.64bitstudio.com/`, **nunca se tocó ni se
+perdió** (`certbot certificates` lo confirmó vigente todo el tiempo,
+87 días de validez restante) -- solo faltaba que nginx volviera a
+referenciarlo.
+
+**Restauración real**: el Product Owner corrió directo en la VM (el
+clasificador de permisos bloqueó el mismo comando cuando lo intentó
+Claude, correctamente -- toca dominios de qa/prod):
+```
+sudo certbot --nginx --non-interactive --agree-tos \
+  -m marco.cortes@64bitstudio.com \
+  -d auth.64bitstudio.com -d auth-qa.64bitstudio.com -d auth-dev.64bitstudio.com \
+  --redirect
+```
+Verificado tras correrlo: `auth-qa.64bitstudio.com`/
+`auth-dev.64bitstudio.com` responden `200` de nuevo, TLS restaurado en
+los 3 (`auth.64bitstudio.com` sigue en `404` -- el problema de PROD ya
+documentado arriba, sin relación con este incidente, no tocado).
+
+**Fix de causa raíz** (`platform#8`/`auth-core-mc#85`): nuevo
+`config.certbotDomains` (`List<String>`, opcional) en `corePipeline` --
+corre `certbot --nginx` (vía la misma imagen `platform-host-exec`) justo
+después de aplicar `vhostFile`, replicando exactamente el patrón que
+`ci.yml` ya usaba para `jenkins.conf`/`vm-admin-tools.conf`. No
+bloqueante (`::warning::`, no `failure`) si certbot falla -- mismo
+criterio de tolerancia que ya tiene `ci.yml` para sus propios pasos de
+certbot. `auth-core-mc/Jenkinsfile` pasa
+`certbotDomains: ['auth.64bitstudio.com', 'auth-qa.64bitstudio.com',
+'auth-dev.64bitstudio.com']`.
+
+**Verificado con un deploy real nuevo a `dev`** (build tras mergear
+`platform#8`/`auth-core-mc#85`): ver evidencia al cierre de este ticket
+más abajo.
 
