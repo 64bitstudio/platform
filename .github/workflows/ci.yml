@@ -190,11 +190,27 @@ jobs:
             echo "::warning::Vault sellado o inalcanzable (estado: $SEALED)."
             if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
               MSG=$(printf '*🔒 [platform] Vault sellado o inalcanzable*\nDetectado en sync-vm-infra (push a %s, %s).\nEstado crudo: %s\nAcción: revisar `docker exec vault vault status` en la VM -- si el auto-unseal vía OCI KMS falló, desellar a mano con las recovery keys del gestor de contraseñas de Marco (ver docs/ARQUITECTURA.md, ticket 003, HU-2).\nLos pasos de Transit/secretos de Jenkins que dependen de Vault se omitieron solos en esta corrida, sin tumbar el resto de sync-vm-infra.' "${{ github.ref_name }}" "${{ github.sha }}" "$SEALED")
-              curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              # Hallazgo real (ticket 004): un "curl" sin -f y sin revisar
+              # la respuesta siempre termina en exit 0 aunque Telegram
+              # responda 404 (p.ej. bot token vacío) -- así es como las
+              # notificaciones de este mismo archivo llevaban rotas en
+              # silencio desde el ticket 001 (ver docs/ARQUITECTURA.md,
+              # sección HU-8, para el detalle completo). Se revisa el
+              # código HTTP real Y el campo "ok" del cuerpo de respuesta
+              # de la API de Telegram -- cualquiera de los dos que falle
+              # hace fallar este step de verdad, visible en el run.
+              RESPONSE=$(curl -sS -w '\n%{http_code}' -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                 -d "chat_id=${TELEGRAM_CHAT_ID}" \
                 -d "parse_mode=Markdown" \
-                --data-urlencode "text=$MSG" \
-                > /dev/null || true
+                --data-urlencode "text=$MSG")
+              HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+              BODY=$(echo "$RESPONSE" | sed '$d')
+              OK=$(echo "$BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null || echo "False")
+              if [ "$HTTP_CODE" != "200" ] || [ "$OK" != "True" ]; then
+                echo "::error::No se pudo entregar la alerta de Telegram de HU-8 (HTTP $HTTP_CODE): $BODY"
+                exit 1
+              fi
+              echo "Alerta de Telegram (Vault sellado) entregada de verdad (HTTP $HTTP_CODE)."
             fi
           fi
 
@@ -491,6 +507,15 @@ jobs:
               --data-urlencode "url=http://jenkins:8080/sonarqube-webhook/"
           fi
 
+      # Ticket 004 -- hallazgo real: hasta este ticket, TELEGRAM_BOT_TOKEN/
+      # TELEGRAM_CHAT_ID no existían como GitHub Actions Secrets de este
+      # repo (confirmado con la API, total_count: 0) -- este "curl" sin
+      # -f y sin revisar la respuesta terminaba en exit 0 igual (Telegram
+      # respondía 404 a una URL con el token vacío), así que este step se
+      # veía verde en CADA run desde el ticket 001 sin que el mensaje
+      # llegara nunca de verdad. Ahora sí revisa el código HTTP real y el
+      # campo "ok" de la respuesta -- falla visible si la notificación no
+      # se entrega.
       - name: Notify success (Telegram)
         if: success()
         env:
@@ -499,11 +524,18 @@ jobs:
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           MSG=$(printf '*✅ [platform] infra-sync OK*\nTraefik/SonarQube/Jenkins/Portainer al día en %s (%s).\n%s' "${{ github.ref_name }}" "${{ github.sha }}" "$RUN_URL")
-          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          RESPONSE=$(curl -sS -w '\n%{http_code}' -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
             -d "parse_mode=Markdown" \
-            --data-urlencode "text=$MSG" \
-            > /dev/null
+            --data-urlencode "text=$MSG")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          OK=$(echo "$BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null || echo "False")
+          if [ "$HTTP_CODE" != "200" ] || [ "$OK" != "True" ]; then
+            echo "::error::No se pudo entregar la notificación de éxito a Telegram (HTTP $HTTP_CODE): $BODY"
+            exit 1
+          fi
+          echo "Notificación de éxito entregada de verdad (HTTP $HTTP_CODE)."
 
       - name: Notify failure (Telegram)
         if: failure()
@@ -513,8 +545,15 @@ jobs:
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           MSG=$(printf '*🔴 [platform] infra-sync FALLÓ*\nFalló en %s (%s).\n%s' "${{ github.ref_name }}" "${{ github.sha }}" "$RUN_URL")
-          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          RESPONSE=$(curl -sS -w '\n%{http_code}' -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
             -d "parse_mode=Markdown" \
-            --data-urlencode "text=$MSG" \
-            > /dev/null
+            --data-urlencode "text=$MSG")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          OK=$(echo "$BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null || echo "False")
+          if [ "$HTTP_CODE" != "200" ] || [ "$OK" != "True" ]; then
+            echo "::error::No se pudo entregar la notificación de fallo a Telegram (HTTP $HTTP_CODE): $BODY"
+            exit 1
+          fi
+          echo "Notificación de fallo entregada de verdad (HTTP $HTTP_CODE)."
