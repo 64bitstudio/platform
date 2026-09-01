@@ -347,15 +347,21 @@ jobs:
               fi
             fi
           done
-          # Ticket 006: la llave de la GitHub App es multilinea (PEM real) --
-          # se guarda en su propio archivo (no dentro del .env, que es
-          # linea-por-linea) para evitar corromper saltos de linea. El paso
-          # "Jenkins" mas abajo la exporta como variable de entorno leyendo
-          # este archivo antes de "docker compose up".
-          APPKEY_FILE=/home/ubuntu/secrets/jenkins/github-app-private-key.pem
-          echo "$SECRET_JSON" | python3 -c "import json,sys; key = json.load(sys.stdin)['data']['data'].get('GITHUB_APP_PRIVATE_KEY',''); open('$APPKEY_FILE','w').write(key) if key else None"
-          if [ -s "$APPKEY_FILE" ]; then
-            chmod 600 "$APPKEY_FILE"
+          # Ticket 006: GITHUB_APP_PRIVATE_KEY_B64 -- la llave de la
+          # GitHub App, codificada en base64 (una sola línea) antes de
+          # escribirla en el .env. Vault guarda el PEM real
+          # (multilínea); codificarla aquí, justo antes de escribir el
+          # .env línea-por-línea, evita el hallazgo real de Docker
+          # Compose rompiendo su propio YAML con un valor multilínea
+          # (ver docker-entrypoint-wrapper.sh, que la decodifica de
+          # vuelta dentro del contenedor).
+          APPKEY_B64=$(echo "$SECRET_JSON" | python3 -c "import json,sys,base64; key = json.load(sys.stdin)['data']['data'].get('GITHUB_APP_PRIVATE_KEY',''); print(base64.b64encode(key.encode()).decode() if key else '')")
+          if [ -n "$APPKEY_B64" ]; then
+            if grep -q '^GITHUB_APP_PRIVATE_KEY_B64=' "$ENVFILE"; then
+              sed -i "s#^GITHUB_APP_PRIVATE_KEY_B64=.*#GITHUB_APP_PRIVATE_KEY_B64=${APPKEY_B64}#" "$ENVFILE"
+            else
+              printf 'GITHUB_APP_PRIVATE_KEY_B64=%s\n' "$APPKEY_B64" >> "$ENVFILE"
+            fi
           fi
           echo "Secretos de Jenkins sincronizados desde Vault (valores no impresos)."
 
@@ -472,18 +478,9 @@ jobs:
           set +a
           export DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
           export UBUNTU_GID=$(id -g ubuntu)
-          # Ticket 006: la llave privada de la GitHub App vive en su propio
-          # archivo (ver el paso "Sincronizar secretos de Jenkins desde
-          # Vault"), no en el .env -- se exporta aquí, justo antes de
-          # "docker compose up", para que la interpolación de Compose la
-          # tome con los saltos de línea reales intactos.
-          APPKEY_FILE=/home/ubuntu/secrets/jenkins/github-app-private-key.pem
-          if [ -f "$APPKEY_FILE" ]; then
-            export GITHUB_APP_PRIVATE_KEY=$(cat "$APPKEY_FILE")
-          fi
 
           HASH_FILE=/home/ubuntu/secrets/jenkins/.image-inputs-hash
-          NEW_HASH=$(sha256sum deploy/vm-infra/jenkins/Dockerfile deploy/vm-infra/jenkins/plugins.txt | sha256sum | cut -d' ' -f1)
+          NEW_HASH=$(sha256sum deploy/vm-infra/jenkins/Dockerfile deploy/vm-infra/jenkins/plugins.txt deploy/vm-infra/jenkins/docker-entrypoint-wrapper.sh | sha256sum | cut -d' ' -f1)
           if [ -f "$HASH_FILE" ] && [ "$(cat "$HASH_FILE")" = "$NEW_HASH" ]; then
             echo "Dockerfile/plugins.txt de Jenkins sin cambios -- 'up -d' sin --build (evita recrear/reiniciar Jenkins en cada push; docker compose igual recrea el contenedor si algo de su config SÍ cambió, p.ej. un GID o un secret nuevo)."
             docker compose -f deploy/vm-infra/jenkins/docker-compose.yml up -d

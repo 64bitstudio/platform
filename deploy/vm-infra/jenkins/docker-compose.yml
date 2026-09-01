@@ -73,13 +73,20 @@ services:
       # acotado seguía heredando el bypass de branch protection porque
       # autentica como su cuenta de owner de la organización; una GitHub
       # App tiene su propia identidad, sin ese heredo). GITHUB_APP_ID no
-      # es secreto. GITHUB_APP_PRIVATE_KEY SÍ lo es -- valor multilínea,
-      # el .env de origen lo declara como una asignación bash entre
-      # comillas con saltos de línea reales (no una sola línea "\n"
-      # escapado) para que "source" lo parsee correcto; Docker Compose
-      # preserva esos saltos de línea reales al pasarlo al contenedor.
+      # es secreto.
+      #
+      # Hallazgo real (primer intento): GITHUB_APP_PRIVATE_KEY es
+      # multilínea (PEM real) -- Docker Compose interpola "${VAR}" como
+      # TEXTO PLANO antes de parsear su propio YAML, así que un valor
+      # multilínea rompe la estructura del compose file resultante
+      # (visto en vivo: "exit code 127", fragmentos de la llave
+      # ejecutados como si fueran comandos). Se pasa codificada en
+      # base64 (una sola línea, segura para esa interpolación) y se
+      # decodifica DENTRO del contenedor, antes de que Jenkins arranque
+      # (ver docker-entrypoint-wrapper.sh) -- JCasC nunca ve el valor
+      # sin decodificar.
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
-      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      GITHUB_APP_PRIVATE_KEY_B64: ${GITHUB_APP_PRIVATE_KEY_B64:-}
     volumes:
       - jenkins_home:/var/jenkins_home
       - /var/run/docker.sock:/var/run/docker.sock

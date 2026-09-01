@@ -524,3 +524,47 @@ en vivo que `platform-admin` puede leer/escribir en `secret/` pero
 recibe `403` al intentar `vault operator seal` o montar un secrets
 engine nuevo). Detalle completo, incluyendo el manejo del SecretID
 (nunca expuesto en ningún chat), en `docs/ARQUITECTURA.md`.
+
+## Adenda (2026-09-01, durante ticket 006): un PAT fine-grained acotado NO evita el bypass -- se pivotó a GitHub App
+
+**Hueco real que este documento no cubría**: HU-9 asumía que "un PAT
+nuevo y acotado" (sin `Administration`) bastaba para que GitHub
+rechazara un push directo a una rama protegida, igual que el incidente
+del ticket 002. Se verificó **empíricamente antes de construir nada**
+(no asumido): se replicó el escenario exacto del incidente en una rama
+de prueba (misma protección real de `dev`, copiada campo por campo) con
+un PAT fine-grained de prueba, sin `Administration`, generado por
+Marco. El push **sí se dejó pasar**, con el mismo aviso exacto:
+
+```
+remote: Bypassed rule violations for refs/heads/test-006-pat-bypass-check:
+remote: - Changes must be made through a pull request.
+remote: - Required status check "continuous-integration/jenkins/branch" is expected.
+```
+
+**Causa real, confirmada**: el bypass de GitHub (`enforce_admins:
+false`) exime a cualquier actor con permiso de **admin sobre el
+repo** -- y esto está atado a que la cuenta de Marco es *owner* de la
+organización `64bitstudio`, no a los permisos que un token declare.
+Un PAT, sin importar cuánto se acote, sigue autenticando como esa
+misma cuenta. Evidencia adicional (no la prueba controlada, pero
+consistente): el PAT que ya estaba en uso en producción
+(`jenkins-64bitstudio`) **tampoco tenía `Administration`** desde antes
+del incidente del ticket 002, y aun así el bypass ocurrió entonces.
+
+**Decisión de Marco (2026-09-01)**: pivotar de "PAT fine-grained
+acotado" a una **GitHub App** (`64bitstudio-jenkins-ci`) -- tiene su
+propia identidad, nunca hereda privilegios de ningún usuario humano,
+así que no puede heredar el bypass de admin de nadie. Se descartaron
+las otras dos alternativas evaluadas: una cuenta de máquina separada
+(funcionaría igual de bien para el problema del bypass, pero necesita
+rotación manual de credenciales a futuro, sin renovación automática) y
+mantener el PAT con alguna otra mitigación (no existe ninguna que
+realmente cierre el hueco, confirmado). GitHub App gana en "máxima
+automatización": los tokens de instalación son de vida corta (~1h) y
+se renuevan solos, sin rotación manual nunca.
+
+**Pendiente de verificar con el mecanismo real** (mismo procedimiento
+de arriba, esta vez con la GitHub App en vez del PAT de prueba) -- ver
+`docs/ARQUITECTURA.md`, ticket 006, para el resultado real una vez
+confirmado, no asumido aquí por adelantado.
