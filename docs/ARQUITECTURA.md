@@ -56,13 +56,50 @@ necesita cambiar en el futuro, hace falta decidir un mecanismo nuevo
 (reintroducir un paso similar a este, o moverlo al `Jenkinsfile` de ese
 core) — fuera de alcance de este ticket, señalado aquí a propósito.
 
-### Verificación de punta a punta (ticket 001)
+### Verificación de punta a punta (ticket 001, 2026-09-01)
 
-_Pendiente de completar con evidencia real tras el primer push del PR
-de este ticket — ver la sección "Hecho" del ticket 001
-(`done/001-migrar-infra-compartida-desde-auth-core-mc.md` una vez
-cerrado) para el resultado exacto (estado de `docker ps` en la VM,
-jobs de Jenkins, usuario `marco` en SonarQube, respuesta real de los 4
-subdominios, y confirmación de que un push solo-`docs/` no disparó el
-workflow)._
+Primer push real del PR #1 de este repo (commit `d1bcf0d`) disparó
+`sync-vm-infra` en el runner `vm-oci` (run
+[33461606741](https://github.com/64bitstudio/platform/actions/runs/33461606741)) — 18/18 steps en verde, incluida la notificación de éxito a
+Telegram. Verificado con evidencia real, no solo "el job pasó":
+
+- **Hallazgo real (esperado, no un bug)**: Traefik y Jenkins SÍ se
+  recrearon (contenedores nuevos) en este primer push — confirmado con
+  `docker inspect --format '{{.State.StartedAt}}'`. Causa: sus
+  `docker-compose.yml` bind-montan archivos por **ruta relativa**
+  (`./config/traefik.yml`, `./casc`), y Docker Compose resuelve eso a
+  la ruta ABSOLUTA del checkout en el runner — que cambió de
+  `.../_work/auth-core-mc/auth-core-mc/...` a
+  `.../_work/platform/platform/...` al migrar de repo. Compose ve un
+  "config distinto" y recrea el contenedor, aunque el contenido del
+  archivo sea idéntico. **Sin pérdida de datos**: Traefik no tiene
+  estado (proxy puro). Jenkins guarda todo en el volumen NOMBRADO
+  `vm-infra-jenkins_jenkins_home` (`docker volume inspect` confirma
+  `CreatedAt: 2026-08-30T23:40:49Z`, de ANTES de este ticket, sin
+  tocar) — la recreación del contenedor no toca ese volumen.
+  SonarQube y Portainer NO se recrearon (`docker ps` con timestamps de
+  antes de este push) porque sus compose no bind-montan nada dentro
+  del checkout del repo, solo volúmenes nombrados / `docker.sock`.
+- **Jenkins conserva sus jobs**: `docker exec jenkins ls
+  /var/jenkins_home/jobs/64bitstudio/jobs/` muestra `auth-core-mc`
+  intacto — el job tipo "GitHub Organization" nunca se perdió.
+- **SonarQube conserva el usuario `marco`**: consulta SQL directa a
+  `sonarqube-db` (`select login, active from users where
+  login='marco'`) → `marco | t`, con `created_at` de antes de este
+  ticket.
+- **Los 4 subdominios responden con el backend real** (verificado
+  vía Traefik local en la VM, sin pasar por Basic Auth de nginx, para
+  confirmar que el upstream real está vivo, no solo que nginx devuelve
+  401): `sonarqube.64bitstudio.com` → `200`, `portainer.64bitstudio.com`
+  → `200`, `traefik.64bitstudio.com` → `302` (redirect a `/dashboard/`,
+  esperado), `jenkins.64bitstudio.com` → `403` (propia seguridad de
+  Jenkins para anónimos, esperado). Sin líneas `502`/`504` en el error
+  log de nginx. TLS real de Let's Encrypt vigente en los 4 (`notAfter`
+  entre 28 y 29 de noviembre de 2026) más `auth.64bitstudio.com`
+  (core-specific, sin cambios, TLS igual de vigente).
+- **`paths-ignore: ['docs/**']` funciona de verdad**: un segundo push
+  al mismo PR que solo tocó este archivo (`docs/ARQUITECTURA.md`,
+  commit `86f5a90`) generó **cero check-runs** en GitHub (`gh api
+  .../commits/86f5a90/check-runs` → `total_count: 0`) — el workflow no
+  se disparó, a diferencia del push anterior con cambios reales.
 
