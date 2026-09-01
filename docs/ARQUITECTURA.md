@@ -1002,11 +1002,13 @@ evidencia real:
 Ver `done/003-instalar-vault.md`, sección "Hecho", para el resumen
 completo de cierre del ticket.
 
-## Ticket 004 (2026-09-01, EN PROGRESO): AppRole de Jenkins + migración de secretos de infra
+## Ticket 004 (2026-09-01, CERRADO): AppRole de Jenkins + migración de secretos de infra
 
 Deriva de `docs/definiciones/vault-secrets-manager-vm.md` (VoBo Marco
 2026-09-01, ver la adenda al final para la decisión de esta sección).
-Implementa HU-1 (completa), HU-3, HU-4 y HU-8.
+Implementa HU-1 (completa), HU-3, HU-4 y HU-8. Ver
+`done/004-approle-jenkins-migracion-secretos-infra.md` para la sección
+"Hecho" completa.
 
 ### AppRole `platform-admin` -- credencial administrativa permanente del agente
 
@@ -1147,14 +1149,49 @@ no lo trae) para parsear las respuestas JSON de la API HTTP de Vault
 dentro del step -- se prefirió sobre sumar un plugin de Jenkins
 dedicado solo para esto.
 
-**Pendiente de verificación real de punta a punta** (no solo "el
-código se ve bien"): un deploy real a través del pipeline de Jenkins
-usando esta lógica requiere que este PR esté mergeado a `main` primero
--- la Shared Library "platform" en JCasC usa `defaultVersion: "main"`
-(ver `casc/jenkins.yaml`), así que Jenkins no ve el código de este
-ticket hasta el merge. El siguiente push real a `dev` de `auth-core-mc`
-DESPUÉS del merge será la primera vez que se ejercite esta ruta real --
-señalado explícitamente aquí, no asumido como ya probado.
+### Verificación real de punta a punta -- deploy real a `dev` de `auth-core-mc` (2026-09-01)
+
+Tras mergear #16 a `main`, se forzó un push real a `dev` de
+`auth-core-mc` (PR #86, commit `a8dcf4c5`, build #11 de Jenkins) para
+ejercitar `fetchAndPatchDbPasswordFromVault` en un build real -- no
+asumido, verificado con evidencia directa del log y del filesystem de
+la VM:
+- Login AppRole real contra Vault (`auth/approle/login`), fetch de
+  `secret/data/auth-core-mc/dev`.
+- `DB_PASSWORD` real parcheado en `/home/ubuntu/secrets/auth-core-mc/.env.dev`
+  -- confirmado que el valor coincide con el de Vault **y** que el
+  `mtime` del archivo coincide exacto con el timestamp del build (no
+  coincidencia).
+- `DEV healthy.` / `Finished: SUCCESS`.
+
+### Hallazgo real de seguridad, encontrado en esa misma verificación
+
+El log de ese build (#11) mostró el token de Vault de vida corta **en
+texto plano**: `+ curl -sf -H X-Vault-Token: hvs.CAESIP... http://vault:8200/...`.
+Causa: el `sh` de Jenkins corre con `set -x` (xtrace) por default --
+cada línea de comando se imprime con las variables ya resueltas, y
+`VAULT_TOKEN` (obtenido dinámicamente dentro del script, no un
+credential registrado de Jenkins) no está cubierto por el masking
+automático de `credentials-binding`. Sin corregirlo, se habría repetido
+en **todos** los deploys futuros de **todos** los cores que usen esta
+librería.
+
+Acción inmediata: `vault token revoke -self` sobre ese token expuesto
+en cuanto se detectó (aunque su TTL ya era corto, 15m). Fix real (PR
+#17, commit `b664b34`): `set +x` justo después de `set -euo pipefail`
+en `fetchAndPatchDbPasswordFromVault` -- no afecta `-e`/`-u`/
+`pipefail`, solo apaga el eco automático de cada línea de comando.
+
+**Verificado con un segundo deploy real** (PR #87, commit `d24f1703`,
+build #12 de Jenkins) que el fix funciona de verdad, no solo que el
+código se ve bien:
+- El log completo del build #12 **no contiene ninguna ocurrencia** de
+  `X-Vault-Token` (`grep` sobre el log completo, cero matches).
+- El mecanismo de fetch+patch **sigue funcionando** pese a ya no
+  imprimirse -- confirmado que `/home/ubuntu/secrets/auth-core-mc/.env.dev`
+  volvió a actualizar su `mtime` exactamente en la ventana de este
+  build.
+- `DEV healthy.` / `Finished: SUCCESS`.
 
 **Sí verificado real, sin necesitar el merge** (dos runs completos de
 `sync-vm-infra` en `feature/004-approle-jenkins-migracion-secretos-infra`,
