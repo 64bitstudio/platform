@@ -161,16 +161,24 @@ terminó `SUCCESS`, la recreación ocurrió 4s después de liberarse el
 paso `sh`. Timeout de seguridad de 10 min (con `::warning::` explícito,
 no silencioso) si un build se cuelga.
 
-**2. Resiliencia a reinicio de la VM -- ⚠️ parcial, config verificada, reinicio real pendiente.**
+**2. Resiliencia a reinicio de la VM -- ✅ hecho, verificado con un
+reinicio REAL completo (2026-09-01), no solo config.**
 `restart: unless-stopped` confirmado en los 5 contenedores de infra
 compartida (`docker inspect` real) + runner systemd
 (`actions.runner.64bitstudio.vm-oci-runner.service`, `enabled`,
-confirmado con `systemctl`). **El reinicio real de la VM no se
-ejecutó** -- el clasificador de permisos del harness lo bloqueó
-(correcto que lo bloquee, es una acción de infra crítica que merece
-VoBo explícito de Marco, no implícito por el alcance del ticket).
-Comando exacto para cuando Marco quiera correrlo, en
-`docs/ARQUITECTURA.md` punto 2.
+confirmado con `systemctl`). El reinicio real (bloqueado para el
+agente/orquestador por el clasificador, correctamente -- lo ejecutó
+Marco) coincidió con el resize de la VM de 2 OCPU/12GB a 4 OCPU/24GB
+(Always Free de OCI, aplicado en caliente vía "Edit instance" -> sin
+necesitar un reinicio separado, Marco reinició de todos modos para
+validar este punto). Resultado real tras el reinicio: los 13
+contenedores (5 de infra + los 3 ambientes completos de auth-core-mc)
+y el runner volvieron solos, sin intervención manual -- confirmado con
+`docker ps` (`Up ~1 min`, todos `healthy`) y `systemctl` para el
+runner. Los 4 subdominios (auth-dev/qa, sonarqube, traefik, portainer)
+tardaron ~2 min en responder 200 tras el boot (arranque normal de
+SonarQube/JVM, no un fallo) -- confirmado con curl externo real, no
+solo local.
 
 **3-4. Shared Library + vhost ya no huérfano -- ✅ hecho, verificado en vivo de punta a punta.**
 `vars/corePipeline.groovy` nueva, registrada vía JCasC.
@@ -267,11 +275,12 @@ verdad, `Finished: SUCCESS` en su rama `dev` real.
   separado y acotado (sin bypass de admin) reduciría el radio de un
   error como este.
 
-**Resumen**: 9 de 11 puntos originales cerrados al 100% con evidencia
-real; 1 parcial (reinicio real de VM, bloqueado por el clasificador de
-permisos, comando documentado para cuando Marco lo autorice); 1
-explícitamente fuera de mi alcance (punto 9, skill, es trabajo directo
-de Claude). El proceso de verificación real (no solo "el código se ve
-bien") encontró y resolvió 3 bugs reales que una revisión de código por
-sí sola no hubiera atrapado, más 1 incidente de proceso reportado con
-transparencia total. Nada de esto tocó `qa`/`prod` de ningún core.
+**Resumen**: 10 de 11 puntos originales cerrados al 100% con evidencia
+real (incluye el punto 2, verificado 2026-09-01 con un reinicio real de
+la VM, coincidiendo con el resize a 4 OCPU/24GB); 1 explícitamente fuera
+de mi alcance como agente (punto 9, skill, es trabajo directo de
+Claude, ya cerrado por separado). El proceso de verificación real (no
+solo "el código se ve bien") encontró y resolvió 3 bugs reales que una
+revisión de código por sí sola no hubiera atrapado, más 2 incidentes de
+proceso reportados con transparencia total. Nada de esto tocó
+`qa`/`prod` de ningún core.
