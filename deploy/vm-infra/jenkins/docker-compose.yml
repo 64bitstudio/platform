@@ -67,6 +67,19 @@ services:
       # "vault-jenkins-secret-id"), consumido por
       # vars/corePipeline.groovy en cada deploy.
       VAULT_JENKINS_SECRET_ID: ${VAULT_JENKINS_SECRET_ID:-}
+      # Ticket 006 (docs/definiciones/vault-secrets-manager-vm.md, HU-9):
+      # GitHub App "64bitstudio-jenkins-ci" -- reemplaza al PAT compartido
+      # de la cuenta personal de Marco (hallazgo real: un PAT fine-grained
+      # acotado seguía heredando el bypass de branch protection porque
+      # autentica como su cuenta de owner de la organización; una GitHub
+      # App tiene su propia identidad, sin ese heredo). GITHUB_APP_ID no
+      # es secreto. GITHUB_APP_PRIVATE_KEY SÍ lo es -- valor multilínea,
+      # el .env de origen lo declara como una asignación bash entre
+      # comillas con saltos de línea reales (no una sola línea "\n"
+      # escapado) para que "source" lo parsee correcto; Docker Compose
+      # preserva esos saltos de línea reales al pasarlo al contenedor.
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
     volumes:
       - jenkins_home:/var/jenkins_home
       - /var/run/docker.sock:/var/run/docker.sock

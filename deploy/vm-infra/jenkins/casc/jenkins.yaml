@@ -104,6 +104,33 @@ credentials:
                 y obtener un token de Vault de vida corta (15m) --
                 nunca un token maestro guardado. Generado por
                 deploy/vm-infra/vault/bootstrap-jenkins-approle.sh.
+          - gitHubApp:
+              scope: GLOBAL
+              id: "github-app"
+              appID: "${GITHUB_APP_ID:-}"
+              privateKey: "${GITHUB_APP_PRIVATE_KEY:-}"
+              description: >
+                Ticket 006 (docs/definiciones/vault-secrets-manager-vm.md,
+                HU-9): GitHub App "64bitstudio-jenkins-ci" -- reemplaza al
+                PAT compartido de la cuenta personal de Marco. Hallazgo
+                real que motivó el cambio (probado en vivo, no asumido):
+                un PAT fine-grained SIN "Administration" seguía dejando
+                pasar un push directo a una rama protegida con el mismo
+                aviso de "Bypassed rule violations" del incidente del
+                ticket 002 -- el bypass está atado a que la cuenta de
+                Marco es owner de la organización, no a los permisos que
+                el token declare. Una GitHub App tiene su propia
+                identidad (no la de ningún usuario humano), así que
+                nunca hereda ese bypass. GitHubAppCredentials implementa
+                StandardUsernamePasswordCredentials -- funciona como
+                reemplazo directo de "github-pat" en cualquier
+                withCredentials/checkout existente, sin cambiar la forma
+                en que se usa, solo el id. Los tokens de instalación que
+                genera son de corta vida (~1h) y se renuevan solos --
+                nunca un secreto de larga duración guardado.
+                "github-pat" (el PAT viejo) se deja declarado pero sin
+                usar hasta confirmar el reemplazo de punta a punta;
+                limpieza futura, no de este ticket.
 
 unclassified:
   location:
@@ -135,23 +162,32 @@ unclassified:
             scm:
               git:
                 remote: "https://github.com/64bitstudio/platform.git"
-                credentialsId: "github-pat"
+                credentialsId: "github-app"
   # Ticket 002, punto 6 (investigado antes de asumir que hacía falta un
   # webhook manual por repo -- ver docs/ARQUITECTURA.md, runbook "conectar
   # un proyecto nuevo"): SÍ existe un mecanismo a nivel de organización.
-  # Con "Manage hooks" activado aquí (mismo credential "github-pat" que ya
-  # usa el Organization Folder para escanear 64bitstudio), el plugin
-  # "github" crea/actualiza automáticamente el webhook push de CUALQUIER
-  # repo que el Organization Folder descubra (branch con Jenkinsfile) --
-  # ya no hace falta `POST /repos/<owner>/<repo>/hooks` a mano ni por
-  # script para ningún core nuevo. El webhook ya existente de
-  # auth-core-mc (creado a mano el 2026-08-31) queda re-gestionado por
-  # este mecanismo a partir de aquí (misma URL:
-  # https://jenkins.64bitstudio.com/github-webhook/, sin cambio real).
+  # Con "Manage hooks" activado aquí, el plugin "github" crea/actualiza
+  # automáticamente el webhook push de CUALQUIER repo que el Organization
+  # Folder descubra (branch con Jenkinsfile) -- ya no hace falta
+  # `POST /repos/<owner>/<repo>/hooks` a mano ni por script para ningún
+  # core nuevo. El webhook ya existente de auth-core-mc (creado a mano el
+  # 2026-08-31) queda re-gestionado por este mecanismo a partir de aquí
+  # (misma URL: https://jenkins.64bitstudio.com/github-webhook/, sin
+  # cambio real).
+  #
+  # Ticket 006: credential cambiado de "github-pat" a "github-app" --
+  # mismo mecanismo, identidad distinta (ver el comentario completo en
+  # "credentials:" arriba). La GitHub App además trae su PROPIO webhook
+  # (configurado una vez al crearla, entrega eventos automáticamente para
+  # cualquier repo donde se instale) -- "manageHooks" sigue en true por
+  # compatibilidad con bootstrap-project-branches.sh (ticket 002, que
+  # sigue creando el webhook por repo vía `gh api` con su propia sesión,
+  # no con este credential), no porque siga siendo estrictamente
+  # necesario para repos nuevos que ya tengan la App instalada.
   gitHubPluginConfig:
     configs:
       - name: "github.com (64bitstudio)"
         apiUrl: "https://api.github.com"
-        credentialsId: "github-pat"
+        credentialsId: "github-app"
         manageHooks: true
         clientCacheSize: 20

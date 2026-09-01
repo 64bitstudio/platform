@@ -320,7 +320,19 @@ def call(Map config) {
                         // que se acaba de promover -- el historial de ramas sigue
                         // reflejando la realidad, aunque el despliegue en sí ya
                         // haya ocurrido vía este pipeline, no vía un merge.
-                        withCredentials([usernamePassword(credentialsId: 'github-pat', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PAT')]) {
+                        //
+                        // Ticket 006: credential cambiado a la GitHub App
+                        // ("github-app", ver casc/jenkins.yaml) -- este push SIGUE
+                        // funcionando sin necesitar ningún "bypass" ni permiso
+                        // especial: el SHA que se empuja (env.QA_SHA) ya tiene un
+                        // status check "continuous-integration/jenkins/branch" en
+                        // SUCCESS, reportado durante el build de QA que promovió
+                        // este mismo commit -- la protección de la rama exige que
+                        // el SHA tenga ese check en verde, no que lo reciba en
+                        // este momento. Verificado en vivo (ver docs/ARQUITECTURA.md
+                        // ticket 006) que un push de un commit SIN ese check
+                        // previo, con este mismo credential, sí se rechaza.
+                        withCredentials([usernamePassword(credentialsId: 'github-app', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PAT')]) {
                             sh """
                                 git push https://\${GIT_USER}:\${GIT_PAT}@github.com/64bitstudio/${project}.git HEAD:refs/heads/prod
                             """

@@ -337,7 +337,7 @@ jobs:
             echo "secret/jenkins no existe todavía en Vault -- se omite (nada que sincronizar aún)."
             exit 0
           fi
-          for VAR in GITHUB_PAT SONAR_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID; do
+          for VAR in GITHUB_PAT SONAR_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID GITHUB_APP_ID; do
             VALUE=$(echo "$SECRET_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['data'].get('$VAR',''))")
             if [ -n "$VALUE" ]; then
               if grep -q "^${VAR}=" "$ENVFILE"; then
@@ -347,6 +347,16 @@ jobs:
               fi
             fi
           done
+          # Ticket 006: la llave de la GitHub App es multilinea (PEM real) --
+          # se guarda en su propio archivo (no dentro del .env, que es
+          # linea-por-linea) para evitar corromper saltos de linea. El paso
+          # "Jenkins" mas abajo la exporta como variable de entorno leyendo
+          # este archivo antes de "docker compose up".
+          APPKEY_FILE=/home/ubuntu/secrets/jenkins/github-app-private-key.pem
+          echo "$SECRET_JSON" | python3 -c "import json,sys; key = json.load(sys.stdin)['data']['data'].get('GITHUB_APP_PRIVATE_KEY',''); open('$APPKEY_FILE','w').write(key) if key else None"
+          if [ -s "$APPKEY_FILE" ]; then
+            chmod 600 "$APPKEY_FILE"
+          fi
           echo "Secretos de Jenkins sincronizados desde Vault (valores no impresos)."
 
       # SONAR_TOKEN de Jenkins: red de seguridad de PRIMERA VEZ (Vault
@@ -462,6 +472,15 @@ jobs:
           set +a
           export DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
           export UBUNTU_GID=$(id -g ubuntu)
+          # Ticket 006: la llave privada de la GitHub App vive en su propio
+          # archivo (ver el paso "Sincronizar secretos de Jenkins desde
+          # Vault"), no en el .env -- se exporta aquí, justo antes de
+          # "docker compose up", para que la interpolación de Compose la
+          # tome con los saltos de línea reales intactos.
+          APPKEY_FILE=/home/ubuntu/secrets/jenkins/github-app-private-key.pem
+          if [ -f "$APPKEY_FILE" ]; then
+            export GITHUB_APP_PRIVATE_KEY=$(cat "$APPKEY_FILE")
+          fi
 
           HASH_FILE=/home/ubuntu/secrets/jenkins/.image-inputs-hash
           NEW_HASH=$(sha256sum deploy/vm-infra/jenkins/Dockerfile deploy/vm-infra/jenkins/plugins.txt | sha256sum | cut -d' ' -f1)
