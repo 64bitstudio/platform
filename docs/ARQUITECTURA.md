@@ -141,3 +141,319 @@ o un lock simple en la VM) y lo espere/reintente en vez de recrear a
 ciegas — candidato a hook/chequeo nuevo, mismo criterio que
 `docker-preflight.sh` para el gotcha de OrbStack.
 
+## Ticket 002 (2026-09-01): infra endurecida + runbook de proyecto nuevo
+
+Cierra el hallazgo de arriba y deja mecánico conectar un core nuevo. Ver
+`in-process/002-...md` (o `done/` si ya cerró) para el alcance completo
+y memoria de equipo `saas-paas-cores-strategy`.
+
+### 1. Recreate seguro de Jenkins -- resuelto y verificado en vivo
+
+Nuevo paso en `ci.yml`, **antes** de cualquier `docker compose ... up`
+de Jenkins: "Esperar si Jenkins tiene un paso 'sh' activo antes de
+recrearlo".
+
+**Iteración real del mecanismo** (dos intentos, el primero estaba mal):
+1. Primer intento: leer `<result>` en el `build.xml` de cada build,
+   asumiendo que solo aparece al terminar. **Falso** -- en esta versión
+   de Jenkins aparece desde el primer instante del build (default
+   `SUCCESS`), volviendo el chequeo un no-op (verificado: apareció a los
+   36s de iniciado un build que tardó 165s en terminar de verdad).
+2. El mtime del log tampoco alcanza: `./gradlew test` no imprime nada
+   mientras corren los tests -- se observaron **108s de silencio real**
+   en un build genuino, más que cualquier umbral razonable de "sin
+   output reciente".
+3. **Mecanismo que sí funciona** (el que quedó): el directorio de
+   control que el plugin `durable-task` crea por cada paso `sh` en
+   ejecución (`<workspace-o-subdir>@tmp/durable-<id>/`, dentro de
+   `jenkins_home`, leído vía `docker exec jenkins find ...`, sin
+   necesitar la API HTTP de Jenkins ni credenciales). Confirmado en vivo
+   que aparece exacto al iniciar el paso `sh` y desaparece exacto al
+   terminar, sin depender de si el comando produce output. No existe
+   durante un `input` pausado (gate de prod, hasta 7 días) ni durante
+   `waitForQualityGate` -- ninguno de los dos sostiene un proceso real
+   que una recreación del contenedor pudiera matar (son estado CPS puro,
+   sobreviven un restart de Jenkins), así que correctamente NO bloquean
+   la recreación.
+
+**Verificación real, provocada a propósito (2026-09-01, no solo código
+revisado)**: se pusheó un cambio real a `auth-core-mc` (invalidando el
+cache de Gradle para forzar un build no-cacheado) y, en el instante en
+que el paso `./gradlew build sonar` estaba genuinamente ejecutando
+(`@tmp/durable-c03f659c` presente), se pusheó *casi simultáneamente* un
+cambio real a `platform` que fuerza la recreación de Jenkins (label
+nuevo en `docker-compose.yml`, que si el contenedor ya existía con un
+config distinto SIEMPRE lo recrea, sin depender de si el `Dockerfile`
+cambia). Resultado observado, con timestamps:
+- `sync-vm-infra` llegó al paso "Esperar..." y se quedó ahí mientras
+  `@tmp/durable-320a7f27` (el paso `sh` del build de `auth-core-mc`)
+  seguía presente -- confirmado repetidamente durante ~180s reales,
+  incluyendo los 108s silenciosos de `Task :test`.
+- El directorio `durable-320a7f27` desapareció a las **03:56:11 UTC**
+  (el paso `sh` terminó).
+- Jenkins se recreó a las **03:56:15 UTC** -- 4 segundos después, no
+  antes.
+- El build de `auth-core-mc` (build #4 de esa rama) terminó
+  `Finished: SUCCESS` -- **no lo mató**, a diferencia del incidente
+  original documentado arriba.
+
+Límite aceptado: si un paso `sh` sigue activo tras 10 minutos de espera,
+`sync-vm-infra` procede de todas formas con un `::warning::` explícito
+en el log del run (excepción conocida, no un silencio) -- evita que un
+build colgado bloquee la infra compartida indefinidamente.
+
+### 2. Resiliencia a reinicio de la VM
+
+Verificado con evidencia real (no asumido):
+- `docker inspect --format '{{.HostConfig.RestartPolicy.Name}}'` en los
+  4 contenedores (`jenkins`, `traefik`, `sonarqube`, `sonarqube-db`,
+  `portainer` -- 5 en realidad, Sonar tiene su propia DB) →
+  `unless-stopped` en los 5, consistente con cada `docker-compose.yml`.
+- El runner self-hosted corre como servicio systemd
+  (`actions.runner.64bitstudio.vm-oci-runner.service`),
+  `systemctl is-enabled` → `enabled` (arranca solo al bootear, no algo
+  manual).
+
+**Pendiente real, no verificado**: el criterio de aceptación pide
+confirmar esto con un reinicio REAL de la VM. El comando (`sudo
+reboot`) fue bloqueado por el clasificador de permisos del harness de
+Claude Code (acción de infra crítica) -- correcto que lo bloquee, no se
+intentó forzar. Si Marco quiere la prueba en vivo (no debería tomar más
+de 1-2 min de indisponibilidad total, nada opera de cara a clientes
+reales todavía), el comando exacto es:
+
+```
+ssh ampere-free "sudo reboot"
+# esperar ~60-90s, luego:
+ssh ampere-free "docker ps --format '{{.Names}}\t{{.Status}}'; systemctl is-active actions.runner.64bitstudio.vm-oci-runner.service"
+```
+
+### 3-4. Shared Library + vhost ya no huérfano
+
+Nueva Shared Library estándar de Jenkins en este mismo repo:
+`vars/corePipeline.groovy` (patrón `vars/`, un solo global step
+`corePipeline(config)`). Registrada vía JCasC
+(`deploy/vm-infra/jenkins/casc/jenkins.yaml`,
+`unclassified.globalLibraries`, nombre `"platform"`,
+`defaultVersion: "main"`, `implicit: false` -- cada Jenkinsfile la pide
+explícito con `@Library('platform') _`).
+
+Cubre exactamente lo que hacía el `Jenkinsfile` viejo de `auth-core-mc`
+(build+test+Sonar/Quality Gate/build de imagen/deploy dev-qa-prod/gate
+manual de prod/cleanup.sh/notificación a Telegram) más, nuevo, el paso
+de vhost de nginx (punto 4 -- ya no depende de un `ci.yml` que no existe
+más, corre en la Shared Library en cada deploy a `dev`). Contrato de
+`config` documentado en cabecera del archivo. `deploy: false` desactiva
+todo lo de imagen/vhost/deploy para un core que todavía no tiene
+Dockerfile/deploy real (ver punto 11, `mail-core-mc`). `buildAndTest` es
+un `Closure` opcional (obligatorio pasar el propio, distinto por stack)
+-- si se omite, la etapa queda como placeholder explícito, nunca oculto.
+
+`auth-core-mc/Jenkinsfile` quedó reducido de ~200 líneas a invocar
+`corePipeline(...)` con sus parámetros propios.
+
+**Verificado en vivo** (ver evidencia del punto 1 arriba, mismo build):
+la Shared Library cargó correctamente desde Jenkins, el closure
+`buildAndTest` (gradle + `withSonarQubeEnv`) corrió sin errores de
+sintaxis/CPS, y el build completo (`build+test+Sonar+Quality Gate`)
+terminó `SUCCESS` -- probado contra una rama de feature (`branch 'dev'`
+gatea las etapas de imagen/vhost/deploy, así que esas NO corrieron en
+esa rama, por diseño).
+
+**Pendiente real, no verificado todavía**: las etapas exclusivas de
+`dev` (build de imagen, aplicar el vhost, deploy, healthcheck,
+`cleanup.sh`) requieren un push real a la rama `dev` de `auth-core-mc`
+para ejercitarse -- Jenkins resuelve `branch 'dev'` por el nombre real
+de la rama, no hay forma de simularlo desde una rama de feature. Quien
+cierre este ticket (mergeando `platform#<PR>` y luego
+`auth-core-mc#<PR>` a `dev`) debe verificar, tras ese merge:
+1. El build de Jenkins de la rama `dev` de `auth-core-mc` corre las
+   etapas "Build de la imagen", "Vhost de nginx (dev)" y "Deploy a DEV"
+   en verde.
+2. `curl -I https://auth.64bitstudio.com` (o el endpoint que corresponda
+   una vez resuelto el hallazgo de abajo) no se interrumpe durante ese
+   deploy.
+
+### Hallazgo real, no relacionado con este ticket (2026-09-01): `auth.64bitstudio.com` (PROD) responde 404 ahora mismo
+
+Encontrado al intentar verificar la continuidad de servicio del punto
+4. **No lo causó nada de este ticket** -- confirmado con evidencia:
+
+- `curl https://auth.64bitstudio.com/` → `404` (nginx, no una página de
+  Spring Boot).
+- Mismo resultado pegándole directo a Traefik en la VM con
+  `Host: auth.64bitstudio.com` (bypass de nginx) → `404`.
+- La API de Traefik (`/api/http/routers`) confirma que **no existe
+  ningún router para `auth.64bitstudio.com`** -- solo
+  `auth-core-mc-dev`/`auth-core-mc-qa`, ninguno de prod.
+- El contenedor `auth-core-mc-prod-app-1` SÍ está `Up` y `healthy`
+  (`curl http://localhost:8080/actuator/health` en la VM → `200 UP`),
+  pero sus labels reales (`docker inspect ... Config.Labels`) **no
+  tienen ningún `traefik.*`** y su única red es
+  `auth-core-mc-prod_default` -- NO está conectado a `edge`.
+- El `docker-compose.prod.yml` actual del repo SÍ declara los labels de
+  Traefik y la red `edge` correctamente -- el contenedor que corre hoy
+  es de una versión ANTERIOR del archivo (su label
+  `com.docker.compose.project.config_files` todavía apunta a la ruta
+  vieja `_work/auth-core-mc/auth-core-mc/...`, de antes de la migración
+  del ticket 001) y nunca se ha vuelto a desplegar desde que se agregó
+  el wiring de Traefik.
+
+Es decir: el sitio quedó "huérfano" de Traefik desde que se introdujo
+el ingress compartido, y nadie lo notó porque PROD no se ha vuelto a
+promover desde entonces (el gate de prod es manual, exclusivo de
+Marco). **Se arregla solo con el próximo deploy real a PROD** (que
+recreará el contenedor con los labels correctos) -- no se tocó nada al
+respecto en este ticket (prod está fuera de alcance para mí). Señalado
+aquí explícitamente para que Marco lo sepa antes de asumir que
+`auth.64bitstudio.com` funciona.
+
+### 5. `chmod` de secrets generalizado
+
+`ci.yml`, paso "Permisos de grupo en los secrets de cada proyecto":
+itera `/home/ubuntu/secrets/*/` (todo menos `jenkins/`, que no necesita
+acceso de grupo) en vez de hardcodear `auth-core-mc`. Un core nuevo
+queda cubierto en cuanto Marco cree su carpeta de secrets, sin tocar
+este workflow. Verificado corriendo en `sync-vm-infra` (el paso pasa en
+verde con `auth-core-mc/` ya presente).
+
+### 6. Webhook GitHub → Jenkins automático a nivel de organización
+
+**Investigado antes de asumir que hacía falta un script por repo** (tal
+como pedía el ticket): sí existe un mecanismo de organización. JCasC
+(`unclassified.gitHubPluginConfig`, plugin `github` clásico -- ya
+instalado, ver `plugins.txt`) con `manageHooks: true` sobre el mismo
+credential `github-pat` que ya usa el Organization Folder. Con esto,
+Jenkins crea/mantiene el webhook push de **cualquier** repo que el
+Organization Folder descubra -- sin `POST /repos/<owner>/<repo>/hooks`
+manual ni por script, nunca más, para ningún core futuro.
+
+**Verificado en vivo**: tras aplicar este cambio (`sync-vm-infra`, PR de
+este ticket), el archivo interno de Jenkins
+`github-plugin-configuration.xml` confirma `<manageHooks>true</manageHooks>`.
+Y, más contundente: al pushear una rama nueva de `auth-core-mc` que YA
+tenía webhook (creado a mano antes de este ticket), Jenkins la
+descubrió e indexó en menos de 20 segundos -- consistente con que el
+mecanismo de hooks sigue vivo tras el cambio.
+
+**Límite real, no resuelto por esto**: para un repo TOTALMENTE nuevo
+para Jenkins (nunca escaneado, como `mail-core-mc` -- ver punto 11), el
+webhook no puede autocrearse hasta que el Organization Folder lo
+descubra por PRIMERA vez, y eso requiere un escaneo (el trigger
+periódico corre cada ~4h, `H H/4 * * *`) o un clic manual en Jenkins
+("64Bit Studio" → "Scan Organization Folder Now"). No se encontró forma
+de disparar ese primer escaneo sin autenticarse en Jenkins (su
+seguridad se gestiona 100% por UI desde el ticket 049, sin token de API
+disponible para este flujo) -- es la única acción manual real que le
+queda al runbook de "proyecto nuevo" (ver más abajo), y ocurre UNA vez
+por proyecto nuevo, no en cada push.
+
+### 7. Bootstrap de ramas + branch protection -- automatizado, no manual
+
+`deploy/scripts/bootstrap-project-branches.sh <nombre-del-repo>` --
+script idempotente (`gh api` encadenado): crea `dev`/`qa`/`prod` desde
+la rama default actual, cambia el default a `dev`, y aplica la misma
+branch protection que ya corre en `auth-core-mc` (`required_status_checks`
+con `continuous-integration/jenkins/branch`, `required_conversation_resolution`,
+sin force-push/deletion). Un solo comando, no una receta de pasos
+manuales (ajuste explícito de Marco durante este ticket).
+
+**Verificado en vivo, corrido de verdad contra `mail-core-mc`** (no solo
+teoría -- ver punto 11): rama default pasó a `dev`, las 3 ramas existen,
+y `gh api repos/64bitstudio/mail-core-mc/branches/dev/protection`
+confirma el check requerido y `required_conversation_resolution:true`.
+
+### 8. Runbook: cómo conectar un proyecto nuevo
+
+Con todo lo de arriba, conectar un core nuevo (Jenkinsfile aparte, que
+es código de aplicación, no infra) son 3 pasos mecánicos:
+
+1. **Ramas + protección** (un comando, automatizado por completo):
+   ```
+   ./deploy/scripts/bootstrap-project-branches.sh <nombre-del-repo>
+   ```
+2. **Jenkinsfile del proyecto**, invocando la Shared Library:
+   ```groovy
+   @Library('platform') _
+
+   corePipeline(
+       projectName: '<nombre-del-repo>',
+       healthPorts: [dev: <puerto>, qa: <puerto>, prod: <puerto>],
+       vhostFile: 'deploy/vm-infra/nginx/<nombre-del-repo>.conf',  // opcional
+       buildAndTest: { /* build+test+Sonar propio del stack */ }    // opcional
+   )
+   ```
+   Si el proyecto todavía no tiene Dockerfile/deploy real, usar
+   `deploy: false` y omitir `buildAndTest`/`healthPorts`/`vhostFile`
+   (placeholder mínimo, ver `mail-core-mc/Jenkinsfile`).
+3. **Descubrimiento por Jenkins** (única acción manual real, una vez por
+   proyecto -- ver límite del punto 6): en Jenkins, "64Bit Studio" →
+   "Scan Organization Folder Now" (o esperar hasta 4h al trigger
+   periódico). A partir de ahí, el webhook se automantiene solo.
+
+El resto (secrets del proyecto en `/home/ubuntu/secrets/<repo>/.env.*`,
+permisos de grupo, webhook de SonarQube→Jenkins) ya es 100% automático
+vía `sync-vm-infra` (puntos 5 y lo ya existente).
+
+### 10. SonarQube -- estado real, no cerrado del todo
+
+**Hallazgo real, sin ejecutar nada destructivo todavía**: `docker ps` en
+la Mac SÍ muestra `sonarqube`/`sonarqube-db` corriendo (9+ días de
+uptime). Verificado con `psql` directo a esa DB: **tiene historial real
+de análisis** -- 102 issues registrados de `auth-core-mc` (desde
+2026-08-21) y 8 de `mail-core-mc` (desde 2026-08-26), ambos de ANTES de
+que SonarQube se mudara a la VM. **No se apagó** (`docker compose
+down`) -- la memoria de equipo `vm-deploy-infra-roadmap` ya documentaba
+la decisión de Marco de NO migrar ese historial por simplicidad, pero
+el ticket pide confirmar explícitamente antes de borrar algo con datos
+reales, así que queda pendiente de un sí explícito de Marco antes de
+correr `docker compose -f ~/dev-infra/docker-compose.yml down` (con o
+sin `-v`, según si además quiere borrar los volúmenes).
+
+**CLI `sonar` reconfigurado, con límite real descubierto y verificado en
+vivo**: el CLI `sonar` (SonarQube CLI v1.6.0, no el `sonar-scanner`
+clásico) **no puede combinar Basic Auth de nginx con su propio token**
+-- confirmado montando un proxy local de prueba con Basic Auth: el CLI
+solo manda `Authorization: Bearer <token>`, nunca además
+`Authorization: Basic ...`, e ignora por completo cualquier
+`usuario:password@` embebido en la URL del servidor. Como
+`sonarqube.64bitstudio.com` está detrás de Basic Auth de nginx (decisión
+explícita de Marco, capa extra sobre las 3 herramientas de infra
+privilegiada), pegarle directo desde el CLI no es viable.
+
+Solución verificada en vivo (túnel SSH, exactamente como sugería el
+ticket): `~/dev-infra/scripts/sonar-vm.sh` -- abre un túnel SSH a
+`127.0.0.1:9000` de la VM (mismo puerto interno que ya usa Jenkins,
+bypass total de nginx) y corre `sonar` con
+`SONARQUBE_CLI_SERVER`/`SONARQUBE_CLI_TOKEN` apuntando ahí. Probado con
+un token inválido a propósito: el error viene de SonarQube mismo
+(`401` de la API, no de nginx) -- confirma que la conexión SÍ llega
+directo al SonarQube real de la VM. `~/dev-infra/.env.example`/`.env`
+actualizados: `SONAR_HOST_URL`/`SONAR_TOKEN` viejos marcados
+DEPRECADOS (nada los lee ya), nueva variable `SONARQUBE_CLI_TOKEN_VM`
+(vacía) -- **pendiente que Marco genere ese token** en
+`https://sonarqube.64bitstudio.com` (Administration → Security → Users
+→ Tokens, tras pasar el Basic Auth del navegador) y lo pegue en
+`~/dev-infra/.env`.
+
+### 11. `mail-core-mc` -- caso de prueba real del runbook
+
+Aplicado el runbook completo (puntos 7-8), solo infra, sin tocar lógica
+de negocio (ticket 011 propio de ese repo, sin empezar):
+- `dev`/`qa`/`prod` creadas, `dev` como default, branch protection
+  aplicada -- vía `bootstrap-project-branches.sh mail-core-mc`,
+  verificado con `gh api` real (ver punto 7).
+- `Jenkinsfile` mínimo (`chore/002-infra-jenkinsfile-shared-library`,
+  PR pendiente): `corePipeline(projectName: 'mail-core-mc', deploy:
+  false)` -- sin `buildAndTest` (la imagen de Jenkins no trae Node.js
+  ni un scanner de Sonar para JS/TS todavía, y no existen
+  Dockerfile/deploy/docker-compose.*.yml/cleanup.sh reales, eso es el
+  ticket 011). Cuando ese ticket arranque, este Jenkinsfile se
+  actualiza con el `buildAndTest` real y se quita `deploy:false`.
+- **Pendiente, acción manual única** (ver límite del punto 6): Jenkins
+  todavía no ha escaneado `mail-core-mc` por primera vez (su webhook no
+  puede existir hasta entonces) -- falta "Scan Organization Folder Now"
+  o el trigger periódico (~4h). Verificado con evidencia real que hoy
+  `docker exec jenkins ls jobs/64bitstudio/jobs/` NO incluye
+  `mail-core-mc` todavía.
+

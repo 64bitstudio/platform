@@ -192,14 +192,82 @@ jobs:
       # Jenkins necesita leer los secrets de cada core para que su
       # Jenkinsfile pueda desplegarlo (mismo patrón de permisos ya
       # documentado en el ticket 049 de auth-core-mc: "leer por grupo"
-      # exige también traversal en cada directorio del camino). Esta
-      # lista crece con cada core nuevo (mail-core-mc, etc.) -- agregar
-      # su línea aquí cuando llegue, no repetir el job completo.
+      # exige también traversal en cada directorio del camino).
+      # Generalizado (ticket 002, punto 5): antes hardcodeado solo a
+      # auth-core-mc -- ahora itera TODOS los subdirectorios de
+      # /home/ubuntu/secrets/ que sean de un proyecto (todo menos
+      # "jenkins", que son secrets propios de Jenkins, sin necesidad de
+      # acceso de grupo). Un core nuevo (mail-core-mc, etc.) queda
+      # cubierto en cuanto Marco cree su carpeta de secrets, sin tocar
+      # este workflow.
       - name: Permisos de grupo en los secrets de cada proyecto (para Jenkins)
         run: |
           chmod 710 /home/ubuntu/secrets 2>/dev/null || true
-          chmod 750 /home/ubuntu/secrets/auth-core-mc 2>/dev/null || true
-          chmod 640 /home/ubuntu/secrets/auth-core-mc/.env.* 2>/dev/null || true
+          for dir in /home/ubuntu/secrets/*/; do
+            [ -d "$dir" ] || continue
+            name=$(basename "$dir")
+            [ "$name" = "jenkins" ] && continue
+            chmod 750 "$dir" 2>/dev/null || true
+            chmod 640 "$dir"/.env.* 2>/dev/null || true
+          done
+
+      # Ticket 002, punto 1 (hallazgo real del primer push de este repo,
+      # ver docs/ARQUITECTURA.md: recrear Jenkins mató en seco un build de
+      # gradle en curso de auth-core-mc). Cualquier "docker compose ... up
+      # -d" de Jenkins de abajo PUEDE recrear el contenedor aunque no haya
+      # cambiado Dockerfile/plugins.txt (basta con que cambie algo de su
+      # config real, p.ej. la ruta absoluta del bind mount de casc/ --
+      # exactamente lo que pasó). Antes de tocar el contenedor, se espera
+      # a que Jenkins NO tenga ningún paso "sh" ejecutando un proceso de
+      # verdad ahora mismo -- sin usar la API HTTP de Jenkins (que exige
+      # login, gestionado 100% por UI desde el ticket 049, sin credencial
+      # disponible aquí).
+      #
+      # Iteración real de este mecanismo, verificada en vivo (no solo en
+      # el código, ver docs/ARQUITECTURA.md): la primera versión leía
+      # <result> en el build.xml de cada build, asumiendo que solo
+      # aparece al terminar -- FALSO en esta versión de Jenkins, aparece
+      # (con valor SUCCESS por default) desde el primer instante del
+      # build, volviendo el chequeo un no-op. Tampoco basta con el mtime
+      # del log: "./gradlew test" no imprime nada mientras corren los
+      # tests (más de 100s de silencio observados en un build real), así
+      # que un umbral de "sin output reciente" también da falso negativo
+      # a mitad de un build genuinamente activo.
+      #
+      # Señal real que sí funciona (confirmada en vivo, aparece exacto al
+      # iniciar un paso "sh" y desaparece exacto al terminar, sin importar
+      # si produce output): el directorio de control que el plugin
+      # durable-task crea por cada paso "sh" en ejecución
+      # (<workspace-o-subdir>@tmp/durable-<id>/) -- estado interno del
+      # plugin, no del log ni del build.xml, así que no depende de qué
+      # tan silencioso sea el comando. No existe durante un "input"
+      # pausado (como el gate de prod, hasta 7 días) ni durante
+      # waitForQualityGate -- ninguno de los dos sostiene un proceso real
+      # que una recreación del contenedor pudiera matar (son estado CPS
+      # puro, sobreviven un restart de Jenkins), así que correctamente NO
+      # bloquean la recreación.
+      - name: Esperar si Jenkins tiene un paso "sh" activo antes de recrearlo
+        run: |
+          if ! docker ps --format '{{.Names}}' | grep -qx jenkins; then
+            echo "Jenkins no está corriendo todavía (primer bootstrap) -- nada que esperar."
+            exit 0
+          fi
+          MAX_WAIT=600
+          WAITED=0
+          while true; do
+            ACTIVE=$(docker exec jenkins sh -c "find /var/jenkins_home/jobs -type d -name 'durable-*' -path '*@tmp*' 2>/dev/null" | head -1)
+            if [ -z "$ACTIVE" ]; then
+              echo "Sin ningún paso 'sh' activo -- seguro recrear Jenkins si hace falta."
+              break
+            fi
+            if [ "$WAITED" -ge "$MAX_WAIT" ]; then
+              echo "::warning::Paso 'sh' activo ($ACTIVE) tras ${MAX_WAIT}s de espera -- se procede de todas formas (excepción conocida, no un silencio: un paso real no debería tardar tanto; si esto se repite, investigar por qué)."
+              break
+            fi
+            echo "Paso 'sh' activo ($ACTIVE) -- esperando 20s antes de reintentar ($WAITED/${MAX_WAIT}s)..."
+            sleep 20
+            WAITED=$((WAITED + 20))
+          done
 
       # Reconstruye la imagen de Jenkins solo cuando algo que de verdad la
       # define (Dockerfile o plugins.txt) cambió, comparando contra un
