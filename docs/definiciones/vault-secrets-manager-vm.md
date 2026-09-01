@@ -394,6 +394,10 @@ sin credenciales de larga duración quedando en el runner entre builds.
 
 ## Riesgos y preguntas abiertas
 
+**Todos resueltos con VoBo de Marco (2026-09-01)** — se conservan
+documentados abajo como registro de la decisión y su razón, no como
+pendientes.
+
 - ~~¿El resize de OCI Ampere A1.Flex requiere reinicio o es en
   caliente?~~ **Resuelto en la práctica, no de forma concluyente**:
   Marco guardó el cambio de shape y reinició la VM en el mismo paso
@@ -407,29 +411,26 @@ sin credenciales de larga duración quedando en el runner entre builds.
   existiendo, pero solo para desarrollo local. Queda abierto si algún
   día se retira el de la Mac por completo; no bloquea nada de este
   documento.
-- **Memoria/CPU real de Vault en reposo**, no medida todavía — se mide
-  como parte de la implementación. Con la VM ya en 4 OCPU/24GB (el
-  doble que cuando se escribió la primera versión de este documento),
-  el riesgo de que este número fuerce reconsiderar el diseño es bajo,
-  pero se sigue midiendo con evidencia real, no se asume.
-- **Vault mismo como punto único de falla**: si Vault cae y el
-  auto-unseal también falla, todo deploy queda bloqueado hasta
-  resolverlo a mano. Mitigado parcialmente por HU-2 (respaldo manual),
-  pero es un tradeoff real y consciente de este diseño — coherente con
-  lo que Marco ya aceptó explícitamente (mejorar esto más adelante).
-  Reforzado por el principio de automatización total que confirmó
-  después de este documento: vale la pena que la implementación real
-  incluya una alerta (Telegram, mismo canal que ya usa el pipeline) si
-  Vault queda sellado/inalcanzable, para no descubrirlo hasta que un
-  deploy falle.
+- ~~Memoria/CPU real de Vault en reposo~~ **Confirmado por Marco
+  (2026-09-01): basta con medirlo durante la implementación, sin un
+  límite predefinido en este documento.** No es un riesgo real dado el
+  margen que ya da el resize (4 OCPU/24GB) — se mide con evidencia real
+  como parte del ticket `platform/003`, mismo criterio ya usado con
+  Jenkins/SonarQube.
+- ~~Vault mismo como punto único de falla~~ **Aceptado explícitamente
+  por Marco (2026-09-01) como tradeoff válido para esta etapa**
+  (coherente con "nada opera con clientes reales todavía"). Mitigado
+  con la alerta de Telegram (HU-8) + llaves de respaldo manual (HU-2) —
+  sin HA real (explícitamente fuera de alcance). Se revisará cuando de
+  verdad haga falta, no antes.
 - **El PAT nuevo y acotado (HU-9) sigue siendo, por diseño, la única
   credencial que arranca la cadena de confianza** — vive en el
   credential store de Jenkins (UI), no en Vault, por el mismo motivo
   que el `SecretID` inicial de la AppRole de Jenkins (HU-3): algo tiene
   que existir fuera de Vault para poder autenticarse contra él la
-  primera vez. Ya no es el PAT de admin/owner actual (eso es
-  precisamente lo que HU-9 corrige), así que el radio de daño de que
-  se filtre es mucho menor.
+  primera vez. **Confirmado por Marco (2026-09-01) como aceptable tal
+  cual** — inevitable en cualquier diseño de secrets manager, ya
+  acotado a scope mínimo (HU-9), sin protección adicional pedida.
 
 ## Impacto estimado (tickets tentativos)
 El resize (HU-5, antes "Ticket A") ya está hecho — fuera de esta lista.
