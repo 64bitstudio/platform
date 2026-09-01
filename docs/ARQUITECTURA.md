@@ -1002,3 +1002,249 @@ evidencia real:
 Ver `done/003-instalar-vault.md`, sección "Hecho", para el resumen
 completo de cierre del ticket.
 
+## Ticket 004 (2026-09-01, EN PROGRESO): AppRole de Jenkins + migración de secretos de infra
+
+Deriva de `docs/definiciones/vault-secrets-manager-vm.md` (VoBo Marco
+2026-09-01, ver la adenda al final para la decisión de esta sección).
+Implementa HU-1 (completa), HU-3, HU-4 y HU-8.
+
+### AppRole `platform-admin` -- credencial administrativa permanente del agente
+
+**Hueco real descubierto al empezar este ticket**: tras cerrar el
+ticket 003, Marco guardó y borró el token root de `vault operator
+init` (correcto, por diseño) -- dejando al agente sin ninguna
+credencial administrativa para hacer el trabajo de este ticket (crear
+policies, AppRoles, migrar secretos). El documento de definición cubre
+cómo se autentican los *consumidores* (Jenkins, backend de
+`auth-core-mc`), pero no cómo el agente/operador hace administración
+continua de Vault. Ver la adenda de
+`docs/definiciones/vault-secrets-manager-vm.md` para la decisión
+completa (Marco eligió un AppRole permanente y acotado, `platform-admin`,
+en vez de repetir el préstamo del token root en cada ticket).
+
+**Bootstrap real** (`deploy/vm-infra/vault/bootstrap-admin-approle.sh`,
+idempotente):
+- Habilitado el motor KV v2 en `secret/` (no existía hasta este
+  ticket -- ticket 003 solo habilitó Transit).
+- Habilitado el auth method `approle/`.
+- Policy `platform-admin`: `secret/*` (CRUD), `auth/approle/*` (CRUD),
+  `sys/policies/acl/*` (CRUD), `sys/mounts`/`sys/auth` (solo lectura) --
+  **nunca** `sys/seal`, **nunca** habilitar/deshabilitar auth
+  methods/secrets engines nuevos.
+- AppRole `platform-admin`: `token_ttl=1h`, `token_max_ttl=4h`,
+  `secret_id_ttl=0` (no expira -- es una credencial permanente, decisión
+  explícita de Marco), `secret_id_num_uses=0` (sin límite de usos).
+- **RoleID** (no es secreto): `c29040a4-1356-1c88-6697-b8373e9a626c` --
+  guardado también en `/home/ubuntu/secrets/vault/platform-admin-role-id`
+  por conveniencia, pero puede vivir en cualquier lado (igual que el
+  RoleID de Jenkins, ver HU-3).
+- **SecretID**: nunca expuesto en ningún chat ni en la salida de ningún
+  comando visto por este agente -- generado y redirigido directo a
+  `/home/ubuntu/secrets/vault/platform-admin-secret-id` (permisos `600`,
+  dueño `ubuntu`).
+- **Verificado con pruebas reales, positivas y negativas** (no solo
+  "se creó"): login exitoso vía el AppRole nuevo, escritura/lectura real
+  en `secret/`, **y confirmado con `403` real** que `platform-admin` NO
+  puede sellar Vault ni montar un secrets engine nuevo -- el límite de
+  la policy es real, no solo la intención en el HCL.
+- El token root (`/home/ubuntu/secrets/vault/admin-token.txt`) ya no
+  hace falta -- Marco lo borró (`shred -u`) inmediatamente después de
+  este bootstrap.
+
+### Migración de secretos de infra a Vault (2026-09-01)
+
+`deploy/vm-infra/vault/migrate-infra-secrets.sh` (idempotente, usa el
+AppRole `platform-admin`) migró, en el orden que pide HU-4 (de menor a
+mayor riesgo), verificando cada paso con una lectura de vuelta
+comparada contra el valor original (no solo "el comando no falló"):
+
+| Secreto | Path en Vault | Verificado |
+|---|---|---|
+| `DB_PASSWORD` de DEV | `secret/auth-core-mc/dev` | ✅ round-trip |
+| `DB_PASSWORD` de QA | `secret/auth-core-mc/qa` | ✅ round-trip |
+| `DB_PASSWORD` de PROD | `secret/auth-core-mc/prod` | ✅ round-trip |
+| PAT de GitHub, `SONAR_TOKEN`, tokens de Telegram de Jenkins | `secret/jenkins` | ✅ round-trip |
+| Hash de Basic Auth de nginx | `secret/nginx/basic-auth` | ✅ round-trip |
+
+**Los archivos originales NO se borraron** (HU-4: vía de rollback hasta
+confirmar Vault de punta a punta) -- pasan a ser artefactos
+RENDERIZADOS desde Vault en cada corrida de `sync-vm-infra`/cada deploy
+de Jenkins, nunca la fuente de verdad ni editados a mano desde ahora.
+
+**Hallazgo real, no un bug de este ticket**: al migrar `secret/jenkins`
+se confirmó que `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` están **vacíos
+hoy** en `/home/ubuntu/secrets/jenkins/.env` -- las notificaciones de
+Telegram del propio `post { always {...} } ` de `corePipeline.groovy`
+(por build de Jenkins) nunca han estado activas. No es un fallo
+silencioso: el diseño ya contempla "si quedan vacías, se omite el paso
+de notificar" (ver el propio `.env.example`). Distinto del mecanismo de
+HU-8 de este ticket (alerta de `sync-vm-infra` si Vault se sella), que
+usa el Telegram bot de **GitHub Actions Secrets** (`${{
+secrets.TELEGRAM_BOT_TOKEN }}`), un almacén completamente separado que
+sí está configurado y ya se usaba con éxito desde el ticket 001/002
+(notificaciones de éxito/fallo de `sync-vm-infra`). Señalado aquí para
+que Marco decida si vale la pena llenar también el de Jenkins -- fuera
+de alcance de este ticket, no se toca.
+
+### AppRole `jenkins-infra` (2026-09-01)
+
+`deploy/vm-infra/vault/bootstrap-jenkins-approle.sh` (idempotente, usa
+`platform-admin`) -- solo lectura, solo los paths que
+`vars/corePipeline.groovy` necesita:
+
+- Policy: `secret/data/+/dev`, `secret/data/+/qa`, `secret/data/+/prod`
+  (el `+` es wildcard de un solo segmento -- cubre cualquier proyecto
+  actual o futuro sin tocar la policy, pero solo para los 3 nombres de
+  ambiente literales), `secret/data/jenkins`, `secret/data/nginx/basic-auth`.
+- AppRole: `token_ttl=15m`, `token_max_ttl=30m` (tokens de vida corta,
+  HU-3) -- `secret_id_ttl=0` (el SecretID sí es un bootstrap secret de
+  vida larga por diseño, vive en el credential store de Jenkins).
+- **RoleID** (no es secreto): `36a9755d-af3c-c050-2b78-5126cc829791` --
+  hardcodeado en `vars/corePipeline.groovy` (`JENKINS_VAULT_APPROLE_ROLE_ID`)
+  y en `.github/workflows/ci.yml` (paso "Sincronizar secretos de
+  Jenkins desde Vault") -- duplicado a propósito en dos sistemas
+  distintos (Groovy/YAML) que no comparten un mecanismo de config
+  común; si el AppRole se recrea alguna vez, hay que actualizar los dos
+  lugares (el script de bootstrap lo recuerda al final de su output).
+- **SecretID**: nunca expuesto en ningún chat -- generado y agregado
+  directo a `/home/ubuntu/secrets/jenkins/.env`
+  (`VAULT_JENKINS_SECRET_ID`), inyectado a Jenkins como credential
+  `vault-jenkins-secret-id` vía JCasC (`casc/jenkins.yaml`).
+- **Verificado con pruebas reales, positiva y 3 negativas**: puede leer
+  `secret/auth-core-mc/dev` (✅); **rechazado con 403 real** al intentar
+  leer un ambiente fuera de dev/qa/prod (`.../staging`), al intentar
+  ESCRIBIR (la policy es solo lectura), y al intentar leer datos
+  administrativos de otro AppRole (`platform-admin`). Cumple
+  exactamente el criterio de aceptación del ticket ("verificado
+  intentando leer un path fuera de su policy y confirmando que se
+  rechaza").
+
+### `vars/corePipeline.groovy` -- fetch de `DB_PASSWORD` desde Vault en cada deploy
+
+Nueva función `fetchAndPatchDbPasswordFromVault(project, envName)`,
+llamada automáticamente antes de cada `deployAndVerify` (DEV/QA/PROD) a
+menos que el Jenkinsfile pase `skipVaultSecrets: true` explícitamente
+(escape hatch, no silencioso). **Cualquier core con `deploy: true` que
+use la Shared Library queda cubierto sin tocar su propio Jenkinsfile**
+-- verificado que NO rompe a `mail-core-mc` (su Jenkinsfile ya tiene
+`deploy: false`, así que esta rama de código nunca se ejecuta para ese
+proyecto todavía, confirmado leyendo su Jenkinsfile real antes de
+asumirlo).
+
+Mecanismo: login AppRole -> lee `secret/data/<project>/<env>` -> pasa
+el valor por stdin a la imagen `platform-host-exec` (mismo patrón nsenter
+ya usado para el vhost de nginx) -> `sed -i` sobre la línea
+`DB_PASSWORD=` del archivo real en el host
+(`/home/ubuntu/secrets/<project>/.env.<env>`). El valor **nunca** se
+vuelve una variable de Groovy ni pasa por un `echo` -- fluye completo
+dentro de un solo pipeline de shell. Rollback real (HU-4): si Vault
+está sellado/inalcanzable o el secreto no existe, el step falla
+ruidosamente ANTES de tocar el archivo -- el valor anterior queda
+intacto.
+
+`jq` se agregó al `Dockerfile` de Jenkins (imagen `jenkins/jenkins:lts-jdk21`
+no lo trae) para parsear las respuestas JSON de la API HTTP de Vault
+dentro del step -- se prefirió sobre sumar un plugin de Jenkins
+dedicado solo para esto.
+
+**Pendiente de verificación real de punta a punta** (no solo "el
+código se ve bien"): un deploy real a través del pipeline de Jenkins
+usando esta lógica requiere que este PR esté mergeado a `main` primero
+-- la Shared Library "platform" en JCasC usa `defaultVersion: "main"`
+(ver `casc/jenkins.yaml`), así que Jenkins no ve el código de este
+ticket hasta el merge. El siguiente push real a `dev` de `auth-core-mc`
+DESPUÉS del merge será la primera vez que se ejercite esta ruta real --
+señalado explícitamente aquí, no asumido como ya probado.
+
+**Sí verificado real, sin necesitar el merge** (dos runs completos de
+`sync-vm-infra` en `feature/004-approle-jenkins-migracion-secretos-infra`,
+el segundo en verde total tras corregir el hallazgo de `transit/*` en
+la policy `platform-admin`, ver arriba):
+- Los 6 pasos nuevos/modificados de este ticket, todos `success`:
+  Vault, alerta de sello (HU-8), motor Transit, sincronizar htpasswd
+  desde Vault (confirmado real: detectó que ya coincidía, sin recargar
+  nginx de más), sincronizar secretos de Jenkins desde Vault, y el
+  fallback de `SONAR_TOKEN` (confirmado que NO se ejecuta -- silencioso
+  porque el valor ya estaba puesto, no porque el paso esté roto).
+- Jenkins se reconstruyó de verdad con el `Dockerfile` nuevo (`jq`
+  agregado) -- confirmado `docker exec jenkins jq --version` en la VM
+  (`jq-1.7`), contenedor estable (`Up`, sin crash-loop), JCasC cargó
+  sin `ConfiguratorException` (revisado el log completo del contenedor,
+  ninguna ocurrencia) -- la credencial `vault-jenkins-secret-id` nueva
+  no rompió el arranque de Jenkins.
+
+### HU-8: alerta de Telegram si Vault se sella -- bloqueada por un hallazgo real, no de este ticket
+
+Sellar el Vault real de la VM para probar esto está bloqueado para
+este agente por el clasificador de permisos (acción de estado sobre
+infra compartida real) -- correcto. Se verificó la lógica de detección
+de forma real (JSON simulados: `{"sealed": true}` y una respuesta vacía
+simulando inalcanzable -- confirmado que el parseo distingue
+correctamente los 3 estados), y se probó el envío real forzando
+temporalmente `SEALED="True"` por un solo commit
+(`test(004): forzar SEALED=True...`, revertido en el commit inmediato
+siguiente -- nunca quedó en el estado final del PR).
+
+**Hallazgo real, no de este ticket, descubierto al revisar por qué el
+run falló** (`gh run view --log`, revisando el bloque `env:` de cada
+step -- no algo que se buscaba a propósito): `TELEGRAM_BOT_TOKEN`,
+`TELEGRAM_CHAT_ID`, `SONAR_TOKEN` y `SONAR_HOST_URL` -- los 4 GitHub
+Actions Secrets que `ci.yml` referencia con `${{ secrets.* }}` -- **NO
+EXISTEN, ni a nivel de repo ni de organización**, confirmado con la API
+directa (`gh api repos/64bitstudio/platform/actions/secrets` y
+`.../orgs/64bitstudio/actions/secrets` -> `"total_count": 0` en ambos,
+con un token que sí tiene los scopes `repo`/`admin:org` para verlos si
+existieran). Esto significa, con alta probabilidad:
+
+- **Las notificaciones de Telegram de `sync-vm-infra` nunca se
+  entregaron de verdad**, ni en este ticket ni en los anteriores (001,
+  002, 003) -- el `curl` que las envía no usa `-f` ni revisa la
+  respuesta, así que un token vacío produce una URL malformada
+  (`.../bot/sendMessage`), Telegram responde 404, y `curl` igual
+  termina con exit 0 (no falla el step). El texto de
+  `docs/ARQUITECTURA.md` de tickets anteriores que dice "notificación
+  de éxito a Telegram" documentaba que el STEP se veía verde, no que el
+  mensaje realmente llegó -- diferencia real que no se había detectado
+  hasta ahora.
+- El paso de auto-generación de `SONAR_TOKEN` (con `SONAR_HOST_URL`
+  también vacío) **fallaría de verdad y ruidosamente** si alguna vez
+  tuviera que ejecutarse (no silencioso, por diseño) -- no ha fallado
+  hasta ahora solo porque el `.env` de Jenkins en la VM ya tenía un
+  `SONAR_TOKEN` real puesto desde antes de que `ci.yml` se migrara a
+  este repo (ticket 001), así que su condición (`if ! grep -q
+  '^SONAR_TOKEN=.\+'`) nunca se cumplió.
+
+### HU-8 -- resuelto de verdad (2026-09-01)
+
+Marco decidió: reusar el mismo bot/chat de Telegram que ya usa para
+notificaciones locales en su Mac -- no duplicar credenciales dedicadas
+a la VM. Aplicado y verificado con evidencia real, no solo "se ve
+verde":
+
+1. `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` configurados como GitHub
+   Actions Secrets reales del repo `platform` -- confirmado con la
+   misma API que detectó que estaban vacíos (`gh api
+   repos/64bitstudio/platform/actions/secrets` -> `"total_count": 2`
+   ahora, antes 0).
+2. **Los 3 `curl` a la API de Telegram** (HU-8, `Notify success`,
+   `Notify failure`) ahora revisan el código HTTP real Y el campo `ok`
+   del cuerpo de respuesta -- cualquiera que falle hace fallar el step
+   de verdad (`exit 1` + `::error::`), en vez de que un `curl` sin `-f`
+   se vea verde pase lo que pase.
+3. **Confirmado en un run real** (`feature/004-...`, run
+   `33540897606`): `Notify success (Telegram)` -> `success` -- esta vez
+   con la verificación real de HTTP 200 + `ok:true` pasando de verdad,
+   no solo el exit code de `curl`. Primera entrega confirmada de una
+   notificación de `sync-vm-infra` desde que este job existe.
+
+**`SONAR_TOKEN`/`SONAR_HOST_URL` -- sigue sin resolver, a propósito**:
+el `SONAR_HOST_URL` del `~/dev-infra/.env` de la Mac de Marco apunta a
+`http://localhost:9000` -- el SonarQube LOCAL de su Mac, una instancia
+completamente distinta a la de la VM (separadas a propósito desde el
+ticket 049, "instancia NUEVA sin migrar historial/proyectos"). Reusar
+ese token fallaría contra el SonarQube real de la VM (usuarios/tokens
+no compartidos entre instancias). No se asumió ni se copió un valor
+incorrecto -- señalado a Marco como pregunta aparte, pendiente de su
+respuesta. Sin impacto práctico inmediato: el `SONAR_TOKEN` de Jenkins
+ya migró a Vault con un valor real (ver arriba), este paso de
+auto-generación solo importaría en un rebuild desde cero de la VM.

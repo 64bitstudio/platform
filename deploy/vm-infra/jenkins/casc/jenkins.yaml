@@ -90,6 +90,20 @@ credentials:
               id: "telegram-chat-id"
               secret: "${TELEGRAM_CHAT_ID:-}"
               description: "Chat de Telegram para notificaciones (opcional)."
+          - string:
+              scope: GLOBAL
+              id: "vault-jenkins-secret-id"
+              secret: "${VAULT_JENKINS_SECRET_ID:-}"
+              description: >
+                Ticket 004 (docs/definiciones/vault-secrets-manager-vm.md,
+                HU-3): SecretID del AppRole "jenkins-infra" -- el único
+                bootstrap secret que sigue fuera de Vault por diseño
+                (el RoleID no es secreto, vive hardcodeado en
+                vars/corePipeline.groovy). Consumido vía
+                withCredentials en cada deploy para hacer login AppRole
+                y obtener un token de Vault de vida corta (15m) --
+                nunca un token maestro guardado. Generado por
+                deploy/vm-infra/vault/bootstrap-jenkins-approle.sh.
 
 unclassified:
   location:

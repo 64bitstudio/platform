@@ -169,26 +169,74 @@ jobs:
       - name: Vault (secrets manager compartido de la VM)
         run: docker compose -f deploy/vm-infra/vault/docker-compose.yml up -d
 
-      # Ticket 003: motor Transit + la llave que auth-core-mc ya espera
-      # (VAULT_TRANSIT_KEY_NAME), como paso idempotente de CI en vez de
-      # un comando manual que solo "corrió una vez" -- mismo criterio de
-      # reproducibilidad que ya usa el bootstrap de SONAR_TOKEN más abajo.
-      # Usa el token root que vive en /home/ubuntu/secrets/vault/
-      # init-output.json (fuera de git, permisos 600, generado por
-      # `vault operator init` -- ver docs/ARQUITECTURA.md ticket 003) --
-      # si ese archivo no existe todavía (Vault sin `operator init` por
-      # Marco), el paso se omite con un aviso explícito, nunca falla en
-      # silencio ni bloquea el resto de sync-vm-infra.
+      # Ticket 004 (HU-8): el propio sync-vm-infra, que ya corre en cada
+      # push, verifica el sello de Vault y dispara una alerta de
+      # Telegram DEDICADA (distinta de la notificación genérica de
+      # éxito/fallo del pipeline al final) -- con contexto suficiente
+      # para actuar sin investigar desde cero. No falla el job (Vault
+      # sellado no debe tumbar el resto de la infra compartida) -- los
+      # pasos que sí dependen de Vault más abajo ya se omiten solos con
+      # su propio aviso si esto pasa.
+      - name: Verificar sello de Vault + alertar por Telegram si está sellado/inalcanzable (HU-8)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          HEALTH=$(docker exec vault vault status -format=json 2>/dev/null || echo "")
+          SEALED=$(echo "$HEALTH" | python3 -c "import json,sys; print(json.load(sys.stdin).get('sealed', True))" 2>/dev/null || echo "unreachable")
+          if [ "$SEALED" = "False" ]; then
+            echo "Vault desellado y respondiendo -- OK."
+          else
+            echo "::warning::Vault sellado o inalcanzable (estado: $SEALED)."
+            if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+              MSG=$(printf '*🔒 [platform] Vault sellado o inalcanzable*\nDetectado en sync-vm-infra (push a %s, %s).\nEstado crudo: %s\nAcción: revisar `docker exec vault vault status` en la VM -- si el auto-unseal vía OCI KMS falló, desellar a mano con las recovery keys del gestor de contraseñas de Marco (ver docs/ARQUITECTURA.md, ticket 003, HU-2).\nLos pasos de Transit/secretos de Jenkins que dependen de Vault se omitieron solos en esta corrida, sin tumbar el resto de sync-vm-infra.' "${{ github.ref_name }}" "${{ github.sha }}" "$SEALED")
+              # Hallazgo real (ticket 004): un "curl" sin -f y sin revisar
+              # la respuesta siempre termina en exit 0 aunque Telegram
+              # responda 404 (p.ej. bot token vacío) -- así es como las
+              # notificaciones de este mismo archivo llevaban rotas en
+              # silencio desde el ticket 001 (ver docs/ARQUITECTURA.md,
+              # sección HU-8, para el detalle completo). Se revisa el
+              # código HTTP real Y el campo "ok" del cuerpo de respuesta
+              # de la API de Telegram -- cualquiera de los dos que falle
+              # hace fallar este step de verdad, visible en el run.
+              RESPONSE=$(curl -sS -w '\n%{http_code}' -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -d "chat_id=${TELEGRAM_CHAT_ID}" \
+                -d "parse_mode=Markdown" \
+                --data-urlencode "text=$MSG")
+              HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+              BODY=$(echo "$RESPONSE" | sed '$d')
+              OK=$(echo "$BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null || echo "False")
+              if [ "$HTTP_CODE" != "200" ] || [ "$OK" != "True" ]; then
+                echo "::error::No se pudo entregar la alerta de Telegram de HU-8 (HTTP $HTTP_CODE): $BODY"
+                exit 1
+              fi
+              echo "Alerta de Telegram (Vault sellado) entregada de verdad (HTTP $HTTP_CODE)."
+            fi
+          fi
+
+      # Ticket 003/004: motor Transit + la llave que auth-core-mc ya
+      # espera (VAULT_TRANSIT_KEY_NAME), como paso idempotente de CI en
+      # vez de un comando manual que solo "corrió una vez". Usa el
+      # AppRole "platform-admin" (ver docs/ARQUITECTURA.md, ticket 004)
+      # -- ya NO el token root (borrado por Marco tras el bootstrap
+      # inicial, por diseño). Si el AppRole platform-admin no existe
+      # todavía (Vault recién reconstruido, antes de correr
+      # bootstrap-admin-approle.sh), o Vault sigue sellado, el paso se
+      # omite con un aviso explícito, nunca falla en silencio ni
+      # bloquea el resto de sync-vm-infra.
       - name: Asegurar motor Transit + llave auth-core-mc-tenant-keys en Vault (si falta)
         run: |
-          TOKEN_FILE=/home/ubuntu/secrets/vault/init-output.json
-          if [ ! -f "$TOKEN_FILE" ]; then
-            echo "::warning::$TOKEN_FILE no existe todavía -- Vault sin 'vault operator init' (paso manual de Marco, ver docs/ARQUITECTURA.md ticket 003). Se omite este paso, no es un fallo del pipeline."
+          ROLE_ID_FILE=/home/ubuntu/secrets/vault/platform-admin-role-id
+          SECRET_ID_FILE=/home/ubuntu/secrets/vault/platform-admin-secret-id
+          if [ ! -f "$ROLE_ID_FILE" ] || [ ! -f "$SECRET_ID_FILE" ]; then
+            echo "::warning::AppRole platform-admin no existe todavía (ver deploy/vm-infra/vault/bootstrap-admin-approle.sh). Se omite este paso."
             exit 0
           fi
-          TOKEN=$(python3 -c "import json;print(json.load(open('$TOKEN_FILE'))['root_token'])")
-          if ! docker exec -e VAULT_TOKEN="$TOKEN" vault vault status >/dev/null 2>&1; then
-            echo "::warning::Vault no responde o sigue sellado -- se omite este paso (ver alerta de Telegram si HU-8 ya está activa)."
+          LOGIN_OUT=$(docker exec vault vault write -format=json auth/approle/login \
+            role_id="$(cat "$ROLE_ID_FILE")" secret_id="$(cat "$SECRET_ID_FILE")" 2>/dev/null || echo "")
+          TOKEN=$(echo "$LOGIN_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['auth']['client_token'])" 2>/dev/null || echo "")
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::No se pudo autenticar contra Vault (¿sigue sellado?) -- se omite este paso."
             exit 0
           fi
           if docker exec -e VAULT_TOKEN="$TOKEN" vault vault secrets list -format=json | python3 -c "import json,sys; exit(0 if 'transit/' in json.load(sys.stdin) else 1)"; then
@@ -200,6 +248,47 @@ jobs:
             echo "la llave auth-core-mc-tenant-keys ya existía."
           else
             docker exec -e VAULT_TOKEN="$TOKEN" vault vault write -f transit/keys/auth-core-mc-tenant-keys
+          fi
+
+      # Ticket 004 (HU-1 completa): re-sincroniza el hash de Basic Auth
+      # de nginx DESDE Vault (fuente de verdad desde la migración de
+      # este ticket) -- corre DESPUÉS de que Vault ya está arriba (el
+      # paso original de arriba, "Asegurar Basic Auth...", corre antes
+      # de Vault por dependencia de orden con el vhost, así que sigue
+      # existiendo tal cual como bootstrap de PRIMERA VEZ; este paso es
+      # el que hace la rotación real funcionar después). Solo recarga
+      # nginx si el valor realmente cambió -- evita reloads
+      # innecesarios en cada push.
+      - name: Sincronizar htpasswd de nginx desde Vault (si Vault lo tiene)
+        run: |
+          ROLE_ID_FILE=/home/ubuntu/secrets/vault/platform-admin-role-id
+          SECRET_ID_FILE=/home/ubuntu/secrets/vault/platform-admin-secret-id
+          if [ ! -f "$ROLE_ID_FILE" ] || [ ! -f "$SECRET_ID_FILE" ]; then
+            echo "AppRole platform-admin no existe todavía -- se omite (el archivo local generado por el bootstrap sigue siendo la fuente por ahora)."
+            exit 0
+          fi
+          LOGIN_OUT=$(docker exec vault vault write -format=json auth/approle/login \
+            role_id="$(cat "$ROLE_ID_FILE")" secret_id="$(cat "$SECRET_ID_FILE")" 2>/dev/null || echo "")
+          TOKEN=$(echo "$LOGIN_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['auth']['client_token'])" 2>/dev/null || echo "")
+          if [ -z "$TOKEN" ]; then
+            echo "Vault no alcanzable -- se omite, el archivo local existente queda intacto (rollback real, HU-4)."
+            exit 0
+          fi
+          VAULT_VALUE=$(docker exec -e VAULT_TOKEN="$TOKEN" vault vault kv get -field=htpasswd secret/nginx/basic-auth 2>/dev/null || echo "")
+          if [ -z "$VAULT_VALUE" ]; then
+            echo "secret/nginx/basic-auth no existe todavía en Vault -- se omite (nada que migrar aún)."
+            exit 0
+          fi
+          FILE=/etc/nginx/secrets/vm-admin-tools.htpasswd
+          CURRENT_VALUE=$(sudo cat "$FILE" 2>/dev/null || echo "")
+          if [ "$VAULT_VALUE" = "$CURRENT_VALUE" ]; then
+            echo "htpasswd ya coincide con Vault -- sin cambios."
+          else
+            echo "$VAULT_VALUE" | sudo tee "$FILE" > /dev/null
+            sudo chmod 644 "$FILE"
+            sudo chown root:root "$FILE"
+            sudo nginx -t && sudo systemctl reload nginx
+            echo "htpasswd actualizado desde Vault y nginx recargado."
           fi
 
       # Bootstrap idempotente de /home/ubuntu/secrets/jenkins/.env (nunca
@@ -215,9 +304,56 @@ jobs:
             echo "Creado $ENVFILE (password generado, no impreso). GITHUB_PAT queda vacío -- Marco debe llenarlo a mano."
           fi
 
-      # SONAR_TOKEN de Jenkins: se genera solo (vía la API de SonarQube,
-      # usando el SONAR_TOKEN de admin que ya vive en los secrets del
-      # repo/org) si todavía no hay uno en el .env de Jenkins. Idempotente.
+      # Ticket 004 (HU-1 completa): GITHUB_PAT/SONAR_TOKEN/TELEGRAM_* de
+      # Jenkins, renderizados DESDE Vault (secret/jenkins) en cada
+      # corrida -- a partir de este ticket, Vault es la fuente de
+      # verdad (no el archivo). Usa el AppRole "jenkins-infra" (mismo
+      # que usa vars/corePipeline.groovy en cada deploy -- solo lectura,
+      # ver deploy/vm-infra/vault/bootstrap-jenkins-approle.sh), leyendo
+      # su SecretID del propio .env que este mismo paso mantiene. Si
+      # Vault no está disponible o el AppRole/secreto no existen
+      # todavía, se omite sin tocar el archivo (rollback real, HU-4) --
+      # el paso siguiente (auto-generación de SONAR_TOKEN) sigue
+      # funcionando como red de seguridad de PRIMERA VEZ si esto se
+      # omite y el .env quedó sin SONAR_TOKEN.
+      - name: Sincronizar secretos de Jenkins desde Vault (GITHUB_PAT/SONAR_TOKEN/Telegram)
+        run: |
+          ENVFILE=/home/ubuntu/secrets/jenkins/.env
+          JENKINS_ROLE_ID="36a9755d-af3c-c050-2b78-5126cc829791"
+          JENKINS_SECRET_ID=$(grep -m1 '^VAULT_JENKINS_SECRET_ID=' "$ENVFILE" | cut -d= -f2-)
+          if [ -z "$JENKINS_SECRET_ID" ]; then
+            echo "VAULT_JENKINS_SECRET_ID vacío todavía (ver deploy/vm-infra/vault/bootstrap-jenkins-approle.sh) -- se omite este paso."
+            exit 0
+          fi
+          LOGIN_OUT=$(docker exec vault vault write -format=json auth/approle/login \
+            role_id="$JENKINS_ROLE_ID" secret_id="$JENKINS_SECRET_ID" 2>/dev/null || echo "")
+          TOKEN=$(echo "$LOGIN_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['auth']['client_token'])" 2>/dev/null || echo "")
+          if [ -z "$TOKEN" ]; then
+            echo "Vault no alcanzable/sellado -- se omite, el .env existente queda intacto (rollback real, HU-4)."
+            exit 0
+          fi
+          SECRET_JSON=$(docker exec -e VAULT_TOKEN="$TOKEN" vault vault kv get -format=json secret/jenkins 2>/dev/null || echo "")
+          if [ -z "$SECRET_JSON" ]; then
+            echo "secret/jenkins no existe todavía en Vault -- se omite (nada que sincronizar aún)."
+            exit 0
+          fi
+          for VAR in GITHUB_PAT SONAR_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID; do
+            VALUE=$(echo "$SECRET_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['data'].get('$VAR',''))")
+            if [ -n "$VALUE" ]; then
+              if grep -q "^${VAR}=" "$ENVFILE"; then
+                sed -i "s#^${VAR}=.*#${VAR}=${VALUE}#" "$ENVFILE"
+              else
+                printf '%s=%s\n' "$VAR" "$VALUE" >> "$ENVFILE"
+              fi
+            fi
+          done
+          echo "Secretos de Jenkins sincronizados desde Vault (valores no impresos)."
+
+      # SONAR_TOKEN de Jenkins: red de seguridad de PRIMERA VEZ (Vault
+      # recién instalado, todavía sin secret/jenkins) -- se genera solo
+      # (vía la API de SonarQube, usando el SONAR_TOKEN de admin que ya
+      # vive en los secrets del repo/org) si el paso de arriba no dejó
+      # ninguno puesto. Idempotente.
       - name: Asegurar SONAR_TOKEN de Jenkins en /home/ubuntu/secrets/jenkins/.env (si falta)
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -371,6 +507,15 @@ jobs:
               --data-urlencode "url=http://jenkins:8080/sonarqube-webhook/"
           fi
 
+      # Ticket 004 -- hallazgo real: hasta este ticket, TELEGRAM_BOT_TOKEN/
+      # TELEGRAM_CHAT_ID no existían como GitHub Actions Secrets de este
+      # repo (confirmado con la API, total_count: 0) -- este "curl" sin
+      # -f y sin revisar la respuesta terminaba en exit 0 igual (Telegram
+      # respondía 404 a una URL con el token vacío), así que este step se
+      # veía verde en CADA run desde el ticket 001 sin que el mensaje
+      # llegara nunca de verdad. Ahora sí revisa el código HTTP real y el
+      # campo "ok" de la respuesta -- falla visible si la notificación no
+      # se entrega.
       - name: Notify success (Telegram)
         if: success()
         env:
@@ -379,11 +524,18 @@ jobs:
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           MSG=$(printf '*✅ [platform] infra-sync OK*\nTraefik/SonarQube/Jenkins/Portainer al día en %s (%s).\n%s' "${{ github.ref_name }}" "${{ github.sha }}" "$RUN_URL")
-          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          RESPONSE=$(curl -sS -w '\n%{http_code}' -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
             -d "parse_mode=Markdown" \
-            --data-urlencode "text=$MSG" \
-            > /dev/null
+            --data-urlencode "text=$MSG")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          OK=$(echo "$BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null || echo "False")
+          if [ "$HTTP_CODE" != "200" ] || [ "$OK" != "True" ]; then
+            echo "::error::No se pudo entregar la notificación de éxito a Telegram (HTTP $HTTP_CODE): $BODY"
+            exit 1
+          fi
+          echo "Notificación de éxito entregada de verdad (HTTP $HTTP_CODE)."
 
       - name: Notify failure (Telegram)
         if: failure()
@@ -393,8 +545,15 @@ jobs:
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           MSG=$(printf '*🔴 [platform] infra-sync FALLÓ*\nFalló en %s (%s).\n%s' "${{ github.ref_name }}" "${{ github.sha }}" "$RUN_URL")
-          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          RESPONSE=$(curl -sS -w '\n%{http_code}' -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
             -d "parse_mode=Markdown" \
-            --data-urlencode "text=$MSG" \
-            > /dev/null
+            --data-urlencode "text=$MSG")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          OK=$(echo "$BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null || echo "False")
+          if [ "$HTTP_CODE" != "200" ] || [ "$OK" != "True" ]; then
+            echo "::error::No se pudo entregar la notificación de fallo a Telegram (HTTP $HTTP_CODE): $BODY"
+            exit 1
+          fi
+          echo "Notificación de fallo entregada de verdad (HTTP $HTTP_CODE)."
