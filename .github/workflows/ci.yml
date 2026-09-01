@@ -1,0 +1,273 @@
+# Ticket 001 (platform): este job es el `sync-vm-infra` que vivía en
+# `auth-core-mc/.github/workflows/ci.yml` (tickets 049/050 de ese repo,
+# ver su docs/ARQUITECTURA.md para la historia técnica completa de cada
+# pieza — no se repite aquí) — movido a este repo porque es infra
+# COMPARTIDA de la VM, no específica de un core. `auth-core-mc` retiró
+# ese job (y su ci.yml completo, ver el commit que lo retira) en el mismo
+# ticket que trajo este archivo aquí. Motivación completa en
+# docs/ARQUITECTURA.md de este repo y en la memoria del equipo
+# `saas-paas-cores-strategy`.
+#
+# Qué se dejó FUERA a propósito al migrar (se queda en auth-core-mc, no
+# es infra compartida): el vhost `nginx/auth-core-mc.conf` y el
+# certificado Let's Encrypt de auth.64bitstudio.com/auth-qa/auth-dev —
+# específicos de ese core. Consecuencia real y documentada (no un
+# descuido): con el ci.yml de auth-core-mc retirado por completo, ese
+# vhost/certificado ya no tiene ningún job que lo vuelva a aplicar si
+# cambiara o si la VM se reconstruyera desde cero — sí sigue
+# renovándose solo (certbot.timer del sistema, verificado activo en la
+# VM), pero un cambio de contenido del vhost necesitaría reintroducir
+# algún mecanismo (mismo patrón aquí, o un paso en el Jenkinsfile) en un
+# ticket futuro si hace falta. Ver docs/ARQUITECTURA.md.
+#
+# `paths-ignore: ['docs/**']` (nuevo respecto al original): regla de
+# este repo (`done/000-directiva-documentacion-y-flujo-de-tareas.md`) —
+# un push que solo toca documentación nunca dispara CI/CD real.
+name: Infra Sync (VM)
+
+on:
+  push:
+    branches: ["**"]
+    paths-ignore:
+      - "docs/**"
+
+jobs:
+  # Asegura la infra compartida de la VM (red `edge`, Traefik, SonarQube,
+  # Jenkins, Portainer, certificados, firewall) en CUALQUIER push (que no
+  # sea solo de docs/), a cualquier rama. Idempotente ("docker compose up
+  # -d"/"docker network create" no hacen nada si ya existen) — seguro de
+  # correr en cada push, no solo la primera vez.
+  sync-vm-infra:
+    runs-on: [self-hosted, vm-oci]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Red compartida "edge" (Traefik <-> stacks de cada proyecto)
+        run: docker network inspect edge >/dev/null 2>&1 || docker network create edge
+
+      # Red interna, SIN tráfico público -- solo para que Jenkins alcance
+      # a SonarQube por nombre de contenedor ("sonarqube:9000"), no vía
+      # Traefik.
+      - name: Red compartida "vm-infra" (Jenkins <-> SonarQube)
+        run: docker network inspect vm-infra >/dev/null 2>&1 || docker network create vm-infra
+
+      - name: Traefik (ingress compartido de la VM, puertas adentro)
+        run: docker compose -f deploy/vm-infra/traefik/docker-compose.yml up -d
+
+      # Mismo patrón que el vhost de auth-core-mc (que se quedó en ese
+      # repo) -- este es el vhost de Jenkins, infra compartida.
+      - name: nginx -> Traefik (vhost de Jenkins)
+        run: |
+          sudo cp deploy/vm-infra/nginx/jenkins.conf /etc/nginx/sites-available/jenkins.conf
+          sudo ln -sf /etc/nginx/sites-available/jenkins.conf /etc/nginx/sites-enabled/jenkins.conf
+          sudo nginx -t
+          sudo systemctl reload nginx
+
+      # Basic Auth compartido de nginx para sonarqube/traefik/
+      # portainer.64bitstudio.com -- hash apr1 (formato que entiende
+      # auth_basic_user_file de nginx, sin depender del paquete
+      # apache2-utils/htpasswd, no instalado en esta VM). Bootstrap
+      # idempotente (nunca pisa un hash ya generado) -- debe correr ANTES
+      # del paso de abajo que copia el vhost, porque "nginx -t" falla si
+      # auth_basic_user_file no existe todavía. Deliberadamente NO bajo
+      # /home/ubuntu/secrets/: ese árbol solo es legible por Docker vía
+      # bind-mount con el UID/GID de cada contenedor (ver "Permisos de
+      # grupo..." más abajo) -- nginx corre como el usuario de sistema
+      # "www-data" sin membresía en el grupo "ubuntu" y sin traversal a
+      # /home/ubuntu (permisos 750). /etc/nginx/secrets/ es el árbol
+      # nativo que nginx ya puede leer (root:root, patrón estándar de
+      # htpasswd, mundo-legible en 644 -- es un hash, no la contraseña en
+      # claro).
+      - name: Asegurar Basic Auth compartido de nginx (.htpasswd) si falta
+        run: |
+          sudo mkdir -p /etc/nginx/secrets
+          sudo chmod 755 /etc/nginx/secrets
+          FILE=/etc/nginx/secrets/vm-admin-tools.htpasswd
+          if [ ! -f "$FILE" ]; then
+            PW=$(openssl rand -base64 24 | tr -d '=+/\n')
+            HASH=$(openssl passwd -apr1 "$PW")
+            printf "admin:%s\n" "$HASH" | sudo tee "$FILE" > /dev/null
+            sudo chmod 644 "$FILE"
+            sudo chown root:root "$FILE"
+            echo "Creado $FILE (usuario 'admin', password generado, no impreso) -- Marco debe pedirlo a quien lo generó si lo perdió."
+          fi
+
+      # Vhost con los 3 subdominios de infra privilegiada (SonarQube,
+      # dashboard de Traefik, Portainer), detrás de Basic Auth. Depende
+      # del paso anterior (el .htpasswd debe existir antes de "nginx -t").
+      - name: nginx -> Traefik (vhost de las 3 herramientas de infra + Basic Auth)
+        run: |
+          sudo cp deploy/vm-infra/nginx/vm-admin-tools.conf /etc/nginx/sites-available/vm-admin-tools.conf
+          sudo ln -sf /etc/nginx/sites-available/vm-admin-tools.conf /etc/nginx/sites-enabled/vm-admin-tools.conf
+          sudo nginx -t
+          sudo systemctl reload nginx
+
+      # Hallazgo real (heredado de auth-core-mc): el firewall local de la
+      # VM (iptables, persistido con iptables-persistent/
+      # netfilter-persistent) solo tenía reglas ACCEPT explícitas para 22
+      # (SSH), 25 (SMTP de mail-core-mc) y 80 (HTTP) -- con un REJECT
+      # catch-all al final. Se agrega la regla justo antes del REJECT
+      # (nunca al final) y se persiste para que sobreviva un reinicio.
+      # Idempotente: no duplica la regla si ya existe.
+      - name: Abrir 443/tcp en el firewall de la VM (para Traefik/nginx HTTPS)
+        run: |
+          if ! sudo iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null; then
+            REJECT_LINE=$(sudo iptables -L INPUT --line-numbers | awk '/REJECT/{print $1; exit}')
+            sudo iptables -I INPUT "$REJECT_LINE" -p tcp --dport 443 -j ACCEPT
+            sudo netfilter-persistent save
+          fi
+
+      # Certificado Let's Encrypt para Jenkins -- petición propia (certbot
+      # exige que TODOS los SAN de una misma petición resuelvan).
+      # Idempotente.
+      - name: Certificado Let's Encrypt para Jenkins
+        continue-on-error: true
+        run: |
+          if ! command -v certbot >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y certbot python3-certbot-nginx
+          fi
+          sudo certbot --nginx --non-interactive --agree-tos \
+            -m marco.cortes@64bitstudio.com \
+            -d jenkins.64bitstudio.com \
+            --redirect
+
+      # Certificado Let's Encrypt para las 3 herramientas de infra
+      # privilegiada -- petición propia, mismo motivo que el de Jenkins.
+      # continue-on-error: true por si el DNS de alguno de los 3 todavía
+      # no propagó del todo cuando corre este paso. Idempotente.
+      - name: Certificado Let's Encrypt para las 3 herramientas de infra
+        continue-on-error: true
+        run: |
+          sudo certbot --nginx --non-interactive --agree-tos \
+            -m marco.cortes@64bitstudio.com \
+            -d sonarqube.64bitstudio.com \
+            -d traefik.64bitstudio.com \
+            -d portainer.64bitstudio.com \
+            --redirect
+
+      - name: SonarQube (compartido de la VM)
+        run: docker compose -f deploy/vm-infra/sonarqube/docker-compose.yml up -d
+
+      # Dashboard web de Docker/Compose, compartido de la VM (no
+      # específico de ningún core). Ver
+      # deploy/vm-infra/portainer/docker-compose.yml para el riesgo
+      # aceptado de docker.sock (mismo ya documentado para Jenkins).
+      - name: Portainer (dashboard de Docker/Compose, compartido de la VM)
+        run: docker compose -f deploy/vm-infra/portainer/docker-compose.yml up -d
+
+      # Bootstrap idempotente de /home/ubuntu/secrets/jenkins/.env (nunca
+      # lo pisa si ya existe con un password real puesto por Marco).
+      - name: Asegurar /home/ubuntu/secrets/jenkins/.env (si falta)
+        run: |
+          mkdir -p /home/ubuntu/secrets/jenkins
+          ENVFILE=/home/ubuntu/secrets/jenkins/.env
+          if [ ! -f "$ENVFILE" ]; then
+            PW=$(openssl rand -base64 24 | tr -d '=+/\n')
+            sed "s#^JENKINS_ADMIN_PASSWORD=.*#JENKINS_ADMIN_PASSWORD=${PW}#" deploy/vm-infra/jenkins/.env.example > "$ENVFILE"
+            chmod 600 "$ENVFILE"
+            echo "Creado $ENVFILE (password generado, no impreso). GITHUB_PAT queda vacío -- Marco debe llenarlo a mano."
+          fi
+
+      # SONAR_TOKEN de Jenkins: se genera solo (vía la API de SonarQube,
+      # usando el SONAR_TOKEN de admin que ya vive en los secrets del
+      # repo/org) si todavía no hay uno en el .env de Jenkins. Idempotente.
+      - name: Asegurar SONAR_TOKEN de Jenkins en /home/ubuntu/secrets/jenkins/.env (si falta)
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          ENVFILE=/home/ubuntu/secrets/jenkins/.env
+          if ! grep -q '^SONAR_TOKEN=.\+' "$ENVFILE"; then
+            NEW_TOKEN=$(curl -sS -u "${SONAR_TOKEN}:" -X POST "${SONAR_HOST_URL}/api/user_tokens/generate" \
+              --data-urlencode "name=jenkins-ci-$(date +%s)" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+            if [ -z "$NEW_TOKEN" ]; then
+              echo "No se pudo generar un token nuevo de SonarQube para Jenkins." >&2
+              exit 1
+            fi
+            sed -i "s#^SONAR_TOKEN=.*#SONAR_TOKEN=${NEW_TOKEN}#" "$ENVFILE"
+            echo "SONAR_TOKEN de Jenkins generado y puesto (no impreso)."
+          fi
+
+      # Jenkins necesita leer los secrets de cada core para que su
+      # Jenkinsfile pueda desplegarlo (mismo patrón de permisos ya
+      # documentado en el ticket 049 de auth-core-mc: "leer por grupo"
+      # exige también traversal en cada directorio del camino). Esta
+      # lista crece con cada core nuevo (mail-core-mc, etc.) -- agregar
+      # su línea aquí cuando llegue, no repetir el job completo.
+      - name: Permisos de grupo en los secrets de cada proyecto (para Jenkins)
+        run: |
+          chmod 710 /home/ubuntu/secrets 2>/dev/null || true
+          chmod 750 /home/ubuntu/secrets/auth-core-mc 2>/dev/null || true
+          chmod 640 /home/ubuntu/secrets/auth-core-mc/.env.* 2>/dev/null || true
+
+      # Reconstruye la imagen de Jenkins solo cuando algo que de verdad la
+      # define (Dockerfile o plugins.txt) cambió, comparando contra un
+      # hash guardado fuera del checkout -- evita recrear/reiniciar
+      # Jenkins en cada push (hallazgo real de auth-core-mc, ticket 049).
+      - name: Jenkins (orquestador del pipeline, compartido de la VM)
+        run: |
+          set -a
+          . /home/ubuntu/secrets/jenkins/.env
+          set +a
+          export DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+          export UBUNTU_GID=$(id -g ubuntu)
+
+          HASH_FILE=/home/ubuntu/secrets/jenkins/.image-inputs-hash
+          NEW_HASH=$(sha256sum deploy/vm-infra/jenkins/Dockerfile deploy/vm-infra/jenkins/plugins.txt | sha256sum | cut -d' ' -f1)
+          if [ -f "$HASH_FILE" ] && [ "$(cat "$HASH_FILE")" = "$NEW_HASH" ]; then
+            echo "Dockerfile/plugins.txt de Jenkins sin cambios -- 'up -d' sin --build (evita recrear/reiniciar Jenkins en cada push; docker compose igual recrea el contenedor si algo de su config SÍ cambió, p.ej. un GID o un secret nuevo)."
+            docker compose -f deploy/vm-infra/jenkins/docker-compose.yml up -d
+          else
+            echo "Dockerfile/plugins.txt de Jenkins cambiaron (o es la primera corrida) -- reconstruyendo imagen."
+            docker compose -f deploy/vm-infra/jenkins/docker-compose.yml up -d --build
+            echo "$NEW_HASH" > "$HASH_FILE"
+          fi
+
+      # El step "Quality Gate" del Jenkinsfile de cada core
+      # (waitForQualityGate()) necesita que SonarQube avise a Jenkins
+      # cuando termina un análisis -- eso es un webhook configurado DEL
+      # LADO DE SONAR, no del lado de Jenkins. Idempotente (busca por
+      # nombre antes de crear).
+      - name: Webhook de SonarQube -> Jenkins (para el Quality Gate)
+        run: |
+          SONAR_HOST_URL_LOCAL="http://127.0.0.1:9000"
+          SONAR_TOKEN=$(grep '^SONAR_TOKEN=' /home/ubuntu/secrets/jenkins/.env | cut -d= -f2-)
+          if [ -z "${SONAR_TOKEN:-}" ]; then
+            echo "SONAR_TOKEN vacío en el .env de Jenkins -- se omite (Marco todavía no lo llenó)." >&2
+            exit 0
+          fi
+          EXISTS=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL_LOCAL}/api/webhooks/list" | grep -c '"name":"jenkins"' || true)
+          if [ "$EXISTS" = "0" ]; then
+            curl -s -u "${SONAR_TOKEN}:" -X POST "${SONAR_HOST_URL_LOCAL}/api/webhooks/create" \
+              --data-urlencode "name=jenkins" \
+              --data-urlencode "url=http://jenkins:8080/sonarqube-webhook/"
+          fi
+
+      - name: Notify success (Telegram)
+        if: success()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MSG=$(printf '*✅ [platform] infra-sync OK*\nTraefik/SonarQube/Jenkins/Portainer al día en %s (%s).\n%s' "${{ github.ref_name }}" "${{ github.sha }}" "$RUN_URL")
+          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "parse_mode=Markdown" \
+            --data-urlencode "text=$MSG" \
+            > /dev/null
+
+      - name: Notify failure (Telegram)
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MSG=$(printf '*🔴 [platform] infra-sync FALLÓ*\nFalló en %s (%s).\n%s' "${{ github.ref_name }}" "${{ github.sha }}" "$RUN_URL")
+          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "parse_mode=Markdown" \
+            --data-urlencode "text=$MSG" \
+            > /dev/null

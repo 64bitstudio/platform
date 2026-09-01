@@ -1,0 +1,52 @@
+# Ticket 050 (Portainer + subdominios): Portainer CE -- dashboard web para
+# gestionar Docker/Compose de la VM sin CLI (stacks dev/qa/prod,
+# Jenkins, SonarQube, Traefik). Infra COMPARTIDA de la VM, mismo criterio
+# que Traefik/SonarQube/Jenkins: se versiona en auth-core-mc por ser el
+# primer proyecto en configurarla. Ver docs/ARQUITECTURA.md ticket 050.
+#
+# docker.sock montado (rw): Portainer necesita esto para su función misma
+# (arrancar/parar/inspeccionar contenedores, desplegar stacks) -- control
+# equivalente a root sobre Docker en el host. MISMO riesgo, ya aceptado y
+# documentado, que Jenkins (ver deploy/vm-infra/jenkins/docker-compose.yml)
+# -- no se repite la discusión completa acá. A diferencia de Jenkins, la
+# imagen oficial de Portainer corre como root dentro del contenedor por
+# default, así que no hace falta el group_add de DOCKER_GID/UBUNTU_GID que
+# sí necesita Jenkins (que corre como usuario no-root "jenkins").
+# Mitigación real: acceso solo vía Basic Auth de nginx + el login propio
+# de Portainer (que Marco completa a mano en el primer arranque, igual que
+# con Jenkins) -- nadie más que Marco tiene esas credenciales.
+#
+# Sin puerto publicado al host (a diferencia de SonarQube/Jenkins en
+# 127.0.0.1) -- nada en esta VM necesita alcanzar a Portainer localmente,
+# solo el tráfico público vía Traefik/nginx.
+name: vm-infra-portainer
+
+services:
+  portainer:
+    image: portainer/portainer-ce:lts
+    container_name: portainer
+    restart: unless-stopped
+    command:
+      # Solo el listener HTTP interno (9000) -- nginx ya termina TLS en el
+      # borde (ver deploy/vm-infra/nginx/), mismo patrón que el resto de
+      # los servicios detrás de Traefik. Sin el listener HTTPS propio
+      # (9443) ni el túnel de Edge Agent (8000) -- no se usan acá.
+      - "--http-enabled"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    networks:
+      - edge
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.portainer.rule=Host(`portainer.64bitstudio.com`)"
+      - "traefik.http.routers.portainer.entrypoints=web"
+      - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+
+networks:
+  edge:
+    external: true
+
+volumes:
+  portainer_data:

@@ -1,0 +1,73 @@
+# Ticket 049 (rediseño dev/qa/prod): ingress compartido de TODA la VM, no
+# solo de auth-core-mc — Traefik enruta por Host() hacia cualquier stack
+# que se conecte a la red externa `edge` con las labels correctas. Vive en
+# el repo de auth-core-mc por ser el primer proyecto en configurarlo (mismo
+# patrón ya usado para el runner self-hosted de la VM: se documenta y
+# versiona aquí, pero es infraestructura de la VM, no de este proyecto en
+# particular). El ticket gemelo de mail-core-mc debe REUSAR esta instancia
+# (agregar sus propias labels a su propio stack, conectarse a la misma red
+# `edge`) — no levantar un segundo Traefik.
+#
+# DECISIÓN DE MARCO: la VM ya traía nginx en el puerto 80/443 (paquete de
+# fábrica de Ubuntu) — en vez de deshabilitarlo, nginx se queda como puerta
+# de entrada pública y hace de reverse proxy hacia Traefik, que queda
+# puertas adentro. Ver docs/ARQUITECTURA.md ticket 049 para el porqué
+# completo de esta topología y de la alternativa descartada (Traefik
+# terminando TLS él mismo con Let's Encrypt).
+#
+# Por eso Traefik NO publica 80/443 al mundo: solo escucha en
+# 127.0.0.1:8000 (loopback), alcanzable únicamente por el nginx que corre
+# en la misma VM — nunca directo desde internet. Traefik tampoco maneja
+# certificados TLS (sin ACME/Let's Encrypt aquí): nginx los termina (ver
+# deploy/vm-infra/nginx/), y le pasa a Traefik tráfico HTTP plano
+# puertas adentro, con el header Host original intacto (para que Traefik
+# rutee por Host() igual que antes).
+name: vm-infra-traefik
+
+services:
+  traefik:
+    # Hallazgo real (segunda vuelta): el cliente Docker embebido en
+    # traefik:v3.1 negocia por default a la API 1.24 — el Docker Engine
+    # real de la VM (1.55) rechaza cualquier cliente por debajo de 1.40
+    # ("client version 1.24 is too old"). Resultado: el provider Docker de
+    # Traefik nunca pudo leer NINGÚN contenedor/label, enrutando todo a
+    # 404 desde el día uno. El primer intento de arreglarlo (fijar
+    # DOCKER_API_VERSION=1.47 a mano) NO funcionó — confirmado en vivo:
+    # los logs seguían reintentando con 1.24 incluso con esa env var ya
+    # puesta en el contenedor recreado. Es un bug conocido de Traefik
+    # (ver traefik/traefik#12253 y el hilo de la comunidad sobre Docker
+    # 29+/API >=1.40) — el fix real es la negociación automática de
+    # versión que Traefik agregó en v3.6+ (traefik/traefik#12256), no la
+    # env var. Se sube la imagen a v3.7.12 (última estable de la rama
+    # v3.7 al momento de este fix) y se deja DOCKER_API_VERSION como red
+    # de seguridad adicional, no como el fix principal.
+    image: traefik:v3.7.12
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+    environment:
+      - DOCKER_API_VERSION=1.47
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config/traefik.yml:/etc/traefik/traefik.yml:ro
+    networks:
+      - edge
+    labels:
+      # Ticket 050 (Portainer + subdominios): router del propio dashboard
+      # de Traefik hacia el servicio interno "api@internal" (habilitado en
+      # config/traefik.yml con "api.dashboard=true") -- se anuncia a sí
+      # mismo vía el provider docker, mismo mecanismo que cualquier otro
+      # stack de la VM. Detrás de Basic Auth de nginx (ver
+      # deploy/vm-infra/nginx/), sin exponer una API insegura aparte.
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.traefik-dashboard.rule=Host(`traefik.64bitstudio.com`)"
+      - "traefik.http.routers.traefik-dashboard.entrypoints=web"
+      - "traefik.http.routers.traefik-dashboard.service=api@internal"
+
+networks:
+  edge:
+    external: true

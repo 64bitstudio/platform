@@ -1,0 +1,98 @@
+# Ticket 049 (pivote GH Actions -> Jenkins): Jenkins como orquestador del
+# pipeline, reemplazando a .github/workflows/ci.yml (que se mantiene en
+# paralelo hasta confirmar que Jenkins funciona de punta a punta — no se
+# retira todavía). Infra COMPARTIDA de la VM, igual criterio que Traefik/
+# SonarQube: se versiona en auth-core-mc por ser el primer proyecto en
+# configurarlo, pero mail-core-mc (ticket gemelo) debe reusar esta MISMA
+# instancia, no levantar un segundo Jenkins.
+#
+# docker.sock montado (rw), NO Docker-in-Docker: Jenkins necesita construir
+# y desplegar contra el MISMO daemon Docker de la VM que ya usan
+# deploy/docker-compose.{dev,qa,prod}.yml, deploy/cleanup.sh y la red
+# `edge` de Traefik -- un daemon anidado (dind) tendría su propio
+# namespace de imágenes/redes/volúmenes, aislado del real, rompiendo la
+# continuidad con todo lo ya construido (habría que reconstruir las
+# imágenes, la red edge, etc. otra vez adentro). Riesgo aceptado y
+# documentado, no oculto: montar docker.sock le da a cualquier job de
+# Jenkins acceso equivalente a root en el host (puede montar cualquier
+# ruta, correr contenedores privilegiados, etc.) -- MISMO nivel de acceso
+# que YA tiene el runner self-hosted de GitHub Actions (corre como el
+# usuario "ubuntu", miembro del grupo "docker", sin sandboxing extra) —
+# así que no es una categoría de riesgo nueva para esta VM, es el mismo
+# modelo de confianza ya aceptado. Mitigación real: solo Marco tiene
+# login de administrador en Jenkins (ver casc/jenkins.yaml), y el mismo
+# GitHub PAT/credencial no se hardcodea en ningún archivo de este repo.
+#
+# DOCKER_GID/UBUNTU_GID se resuelven en el momento del deploy (el job de
+# CI que trae esto arriba exporta las variables antes de "docker compose
+# up") -- nunca hardcodeados, pueden variar entre hosts.
+#
+# Hallazgo real (primer deploy real de dev vía Jenkins): "docker compose
+# ... --env-file /home/ubuntu/secrets/auth-core-mc/.env.dev up -d" fallaba
+# con "permission denied" -- esos archivos son 600, dueño "ubuntu" (uid
+# 1001 en esta VM), y el usuario "jenkins" del contenedor es uid 1000, sin
+# relación con "ubuntu" -- el montaje read-only de /home/ubuntu/secrets no
+# alcanza si el propio archivo no es legible por ese uid. Mismo mecanismo
+# ya usado para docker.sock: se agrega el GID real de "ubuntu" como grupo
+# suplementario de "jenkins", y los archivos de secrets de cada proyecto
+# se vuelven legibles por grupo (chmod 640) -- ver el paso correspondiente
+# en ci.yml, sync-vm-infra.
+name: vm-infra-jenkins
+
+services:
+  jenkins:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jenkins
+    restart: unless-stopped
+    user: jenkins
+    group_add:
+      - "${DOCKER_GID:?falta DOCKER_GID -- resolver con: stat -c '%g' /var/run/docker.sock}"
+      - "${UBUNTU_GID:?falta UBUNTU_GID -- resolver con: id -g ubuntu}"
+    environment:
+      CASC_JENKINS_CONFIG: /var/jenkins_casc/jenkins.yaml
+      JAVA_OPTS: "-Xmx1536m -Djenkins.install.runSetupWizard=false"
+      JENKINS_ADMIN_USER: ${JENKINS_ADMIN_USER:?falta JENKINS_ADMIN_USER en /home/ubuntu/secrets/jenkins/.env}
+      JENKINS_ADMIN_PASSWORD: ${JENKINS_ADMIN_PASSWORD:?falta JENKINS_ADMIN_PASSWORD en /home/ubuntu/secrets/jenkins/.env}
+      GITHUB_PAT: ${GITHUB_PAT:-}
+      SONAR_HOST_URL: ${SONAR_HOST_URL:-http://sonarqube:9000}
+      SONAR_TOKEN: ${SONAR_TOKEN:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./casc:/var/jenkins_casc:ro
+      # Hallazgo real (gotcha clásico de docker.sock): cuando el CLI de
+      # docker corre DENTRO de un contenedor pero habla con el daemon del
+      # HOST vía el socket, un flag como "--env-file /home/ubuntu/
+      # secrets/..." lo resuelve el propio proceso del CLI (adentro de
+      # este contenedor), no el host -- si esa ruta no existe también
+      # AQUÍ, con el mismo path, falla con "no such file". Se monta el
+      # mismo directorio de secrets de la VM, 1:1, solo lectura.
+      - /home/ubuntu/secrets:/home/ubuntu/secrets:ro
+    ports:
+      # Solo loopback -- el tráfico público real entra por Traefik/nginx
+      # (ver labels abajo), esto es únicamente para diagnóstico directo
+      # desde la propia VM (mismo patrón que SonarQube en 127.0.0.1:9000).
+      - "127.0.0.1:8090:8080"
+    networks:
+      - default
+      - edge
+      - vm-infra
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.jenkins.rule=Host(`jenkins.64bitstudio.com`)"
+      - "traefik.http.routers.jenkins.entrypoints=web"
+      - "traefik.http.services.jenkins.loadbalancer.server.port=8080"
+
+networks:
+  edge:
+    external: true
+  vm-infra:
+    external: true
+
+volumes:
+  jenkins_home:
