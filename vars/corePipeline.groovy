@@ -7,7 +7,6 @@
 //   @Library('platform') _
 //   corePipeline(
 //       projectName: 'auth-core-mc',
-//       healthPorts: [dev: 8081, qa: 8082, prod: 8080],
 //       vhostFile: 'deploy/vm-infra/nginx/auth-core-mc.conf',
 //       buildAndTest: {
 //           withEnv([...]) { dir('backend') { withSonarQubeEnv('sonarqube-vm') { sh './gradlew build sonar' } } }
@@ -23,9 +22,14 @@
 // Contrato de `config` (Map):
 //   projectName    (String, obligatorio)  Nombre real del repo/imagen Docker
 //                                          (ej. "auth-core-mc").
-//   healthPorts    (Map, obligatorio si deploy != false)
-//                                          [dev: <puerto>, qa: <puerto>, prod: <puerto>]
-//                                          donde cada ambiente expone su healthcheck.
+//   containerPort  (int, opcional)        Puerto en el que la app escucha DENTRO de su
+//                                          propio contenedor (no el puerto publicado al
+//                                          host -- ver "Hallazgo real" más abajo). Default
+//                                          8080 (Spring Boot). Constante entre dev/qa/prod
+//                                          a propósito: cada ambiente varía el puerto
+//                                          PUBLICADO al host (ver docker-compose.*.yml de
+//                                          cada core), pero el contenedor mismo siempre
+//                                          escucha en el mismo puerto interno.
 //   healthPath     (String, opcional)     Default '/actuator/health' (Spring Boot).
 //                                          mail-core-mc (NestJS) usará '/health'.
 //   healthyPattern (String, opcional)     Substring que debe aparecer en la respuesta
@@ -61,6 +65,24 @@
 // <project>-dev:current) solo en `qa`; gate manual (exclusivo de
 // 'marco') + deploy a prod (promoviendo <project>-qa:current) también
 // en `qa`, tras la aprobación.
+//
+// Hallazgo real (primer deploy real a DEV, 2026-09-01): Jenkins mismo
+// corre containerizado (agent any = el propio controller, ver
+// deploy/vm-infra/jenkins/docker-compose.yml) -- sin acceso directo al
+// filesystem/systemd del host ni a los puertos publicados de OTROS
+// contenedores vía "localhost". Dos consecuencias, ambas corregidas
+// aquí:
+//   1. El paso de vhost NO puede usar `sudo cp .../systemctl reload
+//      nginx` directo (ni instalando sudo alcanzaría -- namespaces
+//      distintos) -- usa la imagen "platform-host-exec" (nsenter hacia
+//      el host, ver deploy/vm-infra/jenkins/host-exec/) vía docker.sock,
+//      que Jenkins ya monta.
+//   2. El healthcheck NO puede pegarle a "localhost:<puerto publicado>"
+//      (eso es el loopback del contenedor de JENKINS, no del host) --
+//      le pega directo al contenedor de la app por su nombre
+//      (<project>-<env>-app-1), alcanzable porque ambos comparten la
+//      red "edge" (verificado en vivo: docker exec jenkins curl
+//      http://auth-core-mc-dev-app-1:8080/actuator/health -> 200 UP).
 
 def call(Map config) {
     if (!config.projectName) {
@@ -69,12 +91,9 @@ def call(Map config) {
     def project = config.projectName
     def doDeploy = config.containsKey('deploy') ? config.deploy : true
     def hasBuild = config.buildAndTest != null
+    def containerPort = config.containerPort ?: 8080
     def healthPath = config.healthPath ?: '/actuator/health'
     def healthyPattern = config.healthyPattern ?: '"status":"UP"'
-
-    if (doDeploy && !config.healthPorts) {
-        error("corePipeline: falta config.healthPorts (obligatorio salvo que config.deploy sea false)")
-    }
 
     pipeline {
         agent any
@@ -140,6 +159,14 @@ def call(Map config) {
             // cada deploy a dev, con el vhost viviendo en el propio repo
             // del core (nunca en platform -- es específico de ese
             // proyecto).
+            //
+            // Corre vía la imagen "platform-host-exec" (nsenter hacia el
+            // host, ver el "Hallazgo real" arriba y el Dockerfile de esa
+            // imagen para el porqué completo) -- Jenkins lee el archivo
+            // del vhost desde SU PROPIO checkout (dentro del contenedor)
+            // y lo manda por stdin al contenedor host-exec, que lo
+            // escribe en el /etc/nginx real del host y recarga el nginx
+            // real (no uno de un contenedor).
             stage('Vhost de nginx (dev)') {
                 when {
                     allOf {
@@ -149,10 +176,12 @@ def call(Map config) {
                 }
                 steps {
                     sh """
-                        sudo cp ${config.vhostFile} /etc/nginx/sites-available/${project}.conf
-                        sudo ln -sf /etc/nginx/sites-available/${project}.conf /etc/nginx/sites-enabled/${project}.conf
-                        sudo nginx -t
-                        sudo systemctl reload nginx
+                        cat ${config.vhostFile} | docker run --rm -i --privileged --pid=host platform-host-exec sh -c '
+                            cat > /etc/nginx/sites-available/${project}.conf &&
+                            ln -sf /etc/nginx/sites-available/${project}.conf /etc/nginx/sites-enabled/${project}.conf &&
+                            nginx -t &&
+                            systemctl reload nginx
+                        '
                     """
                 }
             }
@@ -161,7 +190,7 @@ def call(Map config) {
                 when { allOf { branch 'dev'; expression { return doDeploy } } }
                 steps {
                     script {
-                        deployAndVerify(project, 'dev', "${project}:${env.GIT_SHA}", env.GIT_SHA, config.healthPorts.dev, healthPath, healthyPattern)
+                        deployAndVerify(project, 'dev', "${project}:${env.GIT_SHA}", env.GIT_SHA, containerPort, healthPath, healthyPattern)
                     }
                 }
             }
@@ -177,7 +206,7 @@ def call(Map config) {
                         if (!env.QA_SHA) {
                             error("No se encontró ${project}-dev:current -- ¿corrió el deploy a DEV alguna vez?")
                         }
-                        deployAndVerify(project, 'qa', "${project}-dev:current", env.QA_SHA, config.healthPorts.qa, healthPath, healthyPattern)
+                        deployAndVerify(project, 'qa', "${project}-dev:current", env.QA_SHA, containerPort, healthPath, healthyPattern)
                     }
                 }
             }
@@ -212,7 +241,7 @@ def call(Map config) {
                 }
                 steps {
                     script {
-                        deployAndVerify(project, 'prod', "${project}-qa:current", env.QA_SHA, config.healthPorts.prod, healthPath, healthyPattern)
+                        deployAndVerify(project, 'prod', "${project}-qa:current", env.QA_SHA, containerPort, healthPath, healthyPattern)
 
                         // Registro en git: la rama `prod` avanza al mismo commit
                         // que se acaba de promover -- el historial de ramas sigue
@@ -254,15 +283,24 @@ def call(Map config) {
 // espera a que el healthcheck responda "arriba", y corre cleanup.sh --
 // mismo procedimiento repetido antes en dev/qa/prod dentro de cada
 // Jenkinsfile de core, ahora factorizado una sola vez.
-def deployAndVerify(project, envName, sourceImageRef, releaseTag, port, healthPath, healthyPattern) {
+//
+// El healthcheck le pega directo al contenedor de la app por su NOMBRE
+// (no "localhost:<puerto>" -- ver "Hallazgo real" en la cabecera de este
+// archivo). El nombre lo fija Docker Compose de forma determinística
+// como "<project.name del compose>-<service>-<replica>"; cada
+// docker-compose.<env>.yml de un core declara "name: <project>-<env>" y
+// el servicio se llama "app" con una sola réplica -- de ahí
+// "<project>-<env>-app-1".
+def deployAndVerify(project, envName, sourceImageRef, releaseTag, containerPort, healthPath, healthyPattern) {
     sh "docker tag ${sourceImageRef} ${project}-${envName}:${releaseTag}"
     sh "docker tag ${sourceImageRef} ${project}-${envName}:current"
     sh """
         IMAGE_TAG=current docker compose -f deploy/docker-compose.${envName}.yml --env-file /home/ubuntu/secrets/${project}/.env.${envName} up -d
     """
+    def containerName = "${project}-${envName}-app-1"
     sh """
         for i in \$(seq 1 30); do
-            if curl -sf http://localhost:${port}${healthPath} | grep -q '${healthyPattern}'; then
+            if curl -sf http://${containerName}:${containerPort}${healthPath} | grep -q '${healthyPattern}'; then
                 echo "${envName.toUpperCase()} healthy."; exit 0
             fi
             echo "Esperando a que ${envName.toUpperCase()} quede healthy... (\$i/30)"; sleep 5
