@@ -1002,3 +1002,52 @@ evidencia real:
 Ver `done/003-instalar-vault.md`, sección "Hecho", para el resumen
 completo de cierre del ticket.
 
+## Ticket 004 (2026-09-01, EN PROGRESO): AppRole de Jenkins + migración de secretos de infra
+
+Deriva de `docs/definiciones/vault-secrets-manager-vm.md` (VoBo Marco
+2026-09-01, ver la adenda al final para la decisión de esta sección).
+Implementa HU-1 (completa), HU-3, HU-4 y HU-8.
+
+### AppRole `platform-admin` -- credencial administrativa permanente del agente
+
+**Hueco real descubierto al empezar este ticket**: tras cerrar el
+ticket 003, Marco guardó y borró el token root de `vault operator
+init` (correcto, por diseño) -- dejando al agente sin ninguna
+credencial administrativa para hacer el trabajo de este ticket (crear
+policies, AppRoles, migrar secretos). El documento de definición cubre
+cómo se autentican los *consumidores* (Jenkins, backend de
+`auth-core-mc`), pero no cómo el agente/operador hace administración
+continua de Vault. Ver la adenda de
+`docs/definiciones/vault-secrets-manager-vm.md` para la decisión
+completa (Marco eligió un AppRole permanente y acotado, `platform-admin`,
+en vez de repetir el préstamo del token root en cada ticket).
+
+**Bootstrap real** (`deploy/vm-infra/vault/bootstrap-admin-approle.sh`,
+idempotente):
+- Habilitado el motor KV v2 en `secret/` (no existía hasta este
+  ticket -- ticket 003 solo habilitó Transit).
+- Habilitado el auth method `approle/`.
+- Policy `platform-admin`: `secret/*` (CRUD), `auth/approle/*` (CRUD),
+  `sys/policies/acl/*` (CRUD), `sys/mounts`/`sys/auth` (solo lectura) --
+  **nunca** `sys/seal`, **nunca** habilitar/deshabilitar auth
+  methods/secrets engines nuevos.
+- AppRole `platform-admin`: `token_ttl=1h`, `token_max_ttl=4h`,
+  `secret_id_ttl=0` (no expira -- es una credencial permanente, decisión
+  explícita de Marco), `secret_id_num_uses=0` (sin límite de usos).
+- **RoleID** (no es secreto): `c29040a4-1356-1c88-6697-b8373e9a626c` --
+  guardado también en `/home/ubuntu/secrets/vault/platform-admin-role-id`
+  por conveniencia, pero puede vivir en cualquier lado (igual que el
+  RoleID de Jenkins, ver HU-3).
+- **SecretID**: nunca expuesto en ningún chat ni en la salida de ningún
+  comando visto por este agente -- generado y redirigido directo a
+  `/home/ubuntu/secrets/vault/platform-admin-secret-id` (permisos `600`,
+  dueño `ubuntu`).
+- **Verificado con pruebas reales, positivas y negativas** (no solo
+  "se creó"): login exitoso vía el AppRole nuevo, escritura/lectura real
+  en `secret/`, **y confirmado con `403` real** que `platform-admin` NO
+  puede sellar Vault ni montar un secrets engine nuevo -- el límite de
+  la policy es real, no solo la intención en el HCL.
+- El token root (`/home/ubuntu/secrets/vault/admin-token.txt`) ya no
+  hace falta -- Marco lo borró (`shred -u`) inmediatamente después de
+  este bootstrap.
+

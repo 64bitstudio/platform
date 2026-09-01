@@ -489,3 +489,38 @@ preguntas abiertas antes del VoBo):**
 - Alerta de Telegram si Vault se sella, sumada al alcance (HU-8).
 - PAT de GitHub nuevo y acotado, sumado al alcance de este mismo
   esfuerzo en vez de quedar como ticket futuro aparte (HU-9).
+
+## Adenda (2026-09-01, durante ticket 004): AppRole `platform-admin` para el agente de DevOps
+
+**Hueco real que este documento no cubría**: el diseño original define
+cómo se autentican los *consumidores* de secretos (Jenkins vía HU-3, el
+backend de `auth-core-mc` vía HU-7) contra Vault con AppRoles acotados
+de vida corta — pero no dice cómo el propio agente/operador hace el
+trabajo *administrativo* de Vault (crear esos AppRoles, sus policies,
+escribir los secretos migrados) a lo largo de varios tickets sin
+sostener el token root de forma permanente. Se descubrió en la práctica,
+al cerrar el ticket 003: el token root generado por `vault operator
+init` se guardó en el gestor de contraseñas de Marco y se borró de la
+VM (correcto, por diseño) — dejando al agente sin ninguna credencial
+administrativa para empezar el ticket 004.
+
+**Decisión de Marco (2026-09-01)**: crear un AppRole permanente
+`platform-admin`, acotado (no root, no gestión del seal/KMS, no
+habilitar/deshabilitar auth methods o secrets engines nuevos) pero con
+lo necesario para el trabajo administrativo recurrente: `secret/*`
+(crear/leer/actualizar/borrar secretos KV), `auth/approle/*`
+(crear/gestionar AppRoles de consumidores), `sys/policies/acl/*`
+(crear/gestionar sus policies), y lectura de `sys/mounts`/`sys/auth`
+(para chequeos de idempotencia). Se prefirió esto sobre la alternativa
+(repetir el préstamo temporal del token root en cada ticket que
+necesite cambios administrativos) por consistencia con el resto del
+diseño: Jenkins y el backend de `auth-core-mc` ya tienen AppRoles
+permanentes propios — un AppRole administrativo permanente, pero
+acotado, sigue el mismo patrón en vez de ser una excepción.
+
+Bootstrap real: `deploy/vm-infra/vault/bootstrap-admin-approle.sh`
+(idempotente, incluye pruebas positivas y negativas reales — confirmó
+en vivo que `platform-admin` puede leer/escribir en `secret/` pero
+recibe `403` al intentar `vault operator seal` o montar un secrets
+engine nuevo). Detalle completo, incluyendo el manejo del SecretID
+(nunca expuesto en ningún chat), en `docs/ARQUITECTURA.md`.
