@@ -738,13 +738,12 @@ este a "el push se hubiera rechazado" en vez de "el push se aceptó con
 un aviso". No se investiga ni se implementa en este ticket -- ya se
 extendió más allá de su alcance original.
 
-## Ticket 003 (2026-09-01, EN PROGRESO): instalar Vault (Raft, auto-unseal OCI KMS, Transit)
+## Ticket 003 (2026-09-01, CERRADO): instalar Vault (Raft, auto-unseal OCI KMS, Transit)
 
 Deriva de `docs/definiciones/vault-secrets-manager-vm.md` (VoBo Marco
-2026-09-01). **Este ticket sigue en `pending/`, no en `done/` — bloqueado
-en un paso real que requiere una acción de Marco (ver "Bloqueo real"
-abajo)**; esta sección documenta lo ya construido y verificado hasta ese
-punto, se completa cuando el ticket cierre.
+2026-09-01). Ver `done/003-instalar-vault.md` para la sección "Hecho"
+completa. Esta sección documenta la construcción real, los hallazgos de
+infra encontrados en vivo, y la verificación final de HU-2.
 
 ### Vault -- OCI KMS auto-unseal
 
@@ -977,16 +976,29 @@ esta VM (4 OCPU/24GB, ver ticket 002) -- consistente con lo esperado
 para Vault en reposo, sin tráfico real todavía (ningún consumidor
 conectado hasta el ticket 004/005).
 
-### Pendiente para cerrar este ticket
+### Ticket CERRADO (2026-09-01) -- verificación final de HU-2
 
-- Reinicio real de la VM (bloqueado para este agente, exclusivo de
-  Marco) para verificar HU-2 de punta a punta (auto-unseal sobreviviendo
-  un reboot real, no solo un restart de contenedor) -- **comando exacto
-  pendiente de pedir a Marco cuando el resto de este ticket esté listo
-  para esa verificación final.**
-- Que Marco recupere y guarde el token root + recovery keys de su
-  gestor de contraseñas (ver arriba) y borre el archivo de la VM.
-- Verificar `sync-vm-infra` en verde en un push real (el workflow ya
-  quedó actualizado, pendiente de confirmarse en un run real de GitHub
-  Actions, no solo localmente).
+Reinicio real de la VM (`sudo reboot`, ejecutado por Marco -- acción
+exclusiva de su cuenta, no de este agente). Verificado después, con
+evidencia real:
+
+- `uptime -s` confirmó el reinicio real (no un `docker restart`
+  disfrazado).
+- `docker exec vault vault status` -> `Sealed: false`, `Initialized:
+  true`, sin que nadie corriera `vault operator unseal` -- auto-unseal
+  vía OCI KMS funcionó solo, tal como pide HU-2.
+- Los 15 contenedores (los 14 ya existentes desde el ticket 002 + Vault)
+  volvieron solos, healthy donde aplica (`docker ps`).
+- El runner self-hosted de GitHub Actions (`actions.runner.64bitstudio.vm-oci-runner.service`)
+  volvió solo y quedó `Listening for Jobs`.
+- `sync-vm-infra` confirmado en verde en un run real
+  (`feature/003-instalar-vault`, ambos pasos nuevos de Vault en
+  `success` vía `gh run view`).
+- El archivo temporal con el token root/recovery keys
+  (`/home/ubuntu/secrets/vault/init-output.json`) ya no existe en la VM
+  (`ls -la` lo confirma) -- consistente con que Marco lo recuperó para
+  su gestor de contraseñas y lo borró.
+
+Ver `done/003-instalar-vault.md`, sección "Hecho", para el resumen
+completo de cierre del ticket.
 
