@@ -377,10 +377,25 @@ def call(Map config) {
 // falla ruidosamente ANTES de tocar el archivo real -- el .env
 // existente (con el valor anterior) queda intacto, nunca se pisa con
 // un valor vacío/roto.
+// Hallazgo real de seguridad (ticket 004, primer deploy real a DEV
+// tras el merge, build #11 de auth-core-mc/dev): el `sh` de Jenkins
+// corre con `set -x` (xtrace) por default -- cada comando se imprime
+// en la consola CON las variables ya resueltas. Sin `set +x` explícito
+// aquí, el token de Vault de vida corta (VAULT_TOKEN) quedaba impreso
+// en texto plano en el log del build (`+ curl ... -H "X-Vault-Token:
+// hvs...."`), visible para cualquiera con acceso a los logs de
+// Jenkins. El token de ese build ya se revocó a mano
+// (`vault token revoke -self`) en cuanto se detectó -- pero sin este
+// fix se habría repetido en TODOS los deploys futuros de TODOS los
+// cores que usen esta librería. `set +x` no afecta `set -e`/`-u`/
+// `pipefail` (controlan cosas distintas) -- los `echo` explícitos de
+// error siguen imprimiéndose igual, solo se apaga el eco automático de
+// cada línea de comando.
 def fetchAndPatchDbPasswordFromVault(project, envName) {
     withCredentials([string(credentialsId: 'vault-jenkins-secret-id', variable: 'VAULT_SECRET_ID')]) {
         sh """
             set -euo pipefail
+            set +x
             PAYLOAD=\$(jq -n --arg r "${JENKINS_VAULT_APPROLE_ROLE_ID}" --arg s "\$VAULT_SECRET_ID" '{role_id:\$r, secret_id:\$s}')
             VAULT_TOKEN=\$(curl -sf -X POST http://vault:8200/v1/auth/approle/login -d "\$PAYLOAD" | jq -r '.auth.client_token // empty')
             if [ -z "\$VAULT_TOKEN" ]; then
