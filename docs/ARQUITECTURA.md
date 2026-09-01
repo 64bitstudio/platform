@@ -395,20 +395,44 @@ El resto (secrets del proyecto en `/home/ubuntu/secrets/<repo>/.env.*`,
 permisos de grupo, webhook de SonarQube→Jenkins) ya es 100% automático
 vía `sync-vm-infra` (puntos 5 y lo ya existente).
 
-### 10. SonarQube -- estado real, no cerrado del todo
+### 10. SonarQube -- retirado de la Mac, con VoBo explícito de Marco
 
-**Hallazgo real, sin ejecutar nada destructivo todavía**: `docker ps` en
-la Mac SÍ muestra `sonarqube`/`sonarqube-db` corriendo (9+ días de
-uptime). Verificado con `psql` directo a esa DB: **tiene historial real
-de análisis** -- 102 issues registrados de `auth-core-mc` (desde
+**Hallazgo real, antes de tocar nada**: `docker ps` en la Mac SÍ
+mostraba `sonarqube`/`sonarqube-db` corriendo (9+ días de uptime).
+Verificado con `psql` directo a esa DB: **tenía historial real de
+análisis** -- 102 issues registrados de `auth-core-mc` (desde
 2026-08-21) y 8 de `mail-core-mc` (desde 2026-08-26), ambos de ANTES de
-que SonarQube se mudara a la VM. **No se apagó** (`docker compose
-down`) -- la memoria de equipo `vm-deploy-infra-roadmap` ya documentaba
-la decisión de Marco de NO migrar ese historial por simplicidad, pero
-el ticket pide confirmar explícitamente antes de borrar algo con datos
-reales, así que queda pendiente de un sí explícito de Marco antes de
-correr `docker compose -f ~/dev-infra/docker-compose.yml down` (con o
-sin `-v`, según si además quiere borrar los volúmenes).
+que SonarQube se mudara a la VM. Reportado explícitamente antes de
+apagar nada (mismo patrón ya documentado en la memoria de equipo
+`vm-deploy-infra-roadmap`: Marco ya había decidido NO migrar ese
+historial por simplicidad, pero el ticket pedía confirmar antes de
+borrar datos reales) -- **Marco confirmó explícitamente**, entonces sí
+se corrió `docker compose -f ~/dev-infra/docker-compose.yml down`.
+Verificado con evidencia real: `docker ps` ya no lista
+`sonarqube`/`sonarqube-db`.
+
+**Efecto colateral real, encontrado y corregido en el momento**: ese
+mismo `docker-compose.yml` de `~/dev-infra` también define el
+contenedor `vault` (motor Transit local para cifrado por sobres de
+`auth-core-mc`, ticket 017 -- ver memoria `saas-paas-cores-strategy`,
+"NO extender a producción el Vault que ya existe en `~/dev-infra`").
+`docker compose down` sobre el archivo completo paró TODOS sus
+servicios, `vault` incluido, no solo SonarQube -- ninguno de los dos
+tenía su propio `docker-compose.yml` separado. Corregido de inmediato,
+en la misma sesión: `docker compose -f ~/dev-infra/docker-compose.yml
+up -d vault` lo volvió a levantar, y como todo contenedor de Vault
+queda SELLADO tras cualquier reinicio (comportamiento normal, no un
+bug -- ver el comentario de `VAULT_UNSEAL_KEY` en `~/dev-infra/.env`),
+se corrió `~/dev-infra/scripts/vault-unseal.sh` para desellarlo --
+confirmado con `Sealed: false` en la salida real del comando. Sin
+pérdida de datos (el volumen de Vault no se tocó, `docker compose down`
+sin `-v`). **Consecuencia a futuro, no resuelta aquí**: si `vault` y
+`sonarqube` (este último ya retirado) seguían compartiendo un mismo
+`docker-compose.yml` de `~/dev-infra`, cualquier operación futura sobre
+ESE archivo (ya solo con Vault adentro) es más simple ahora que
+SonarQube salió -- no se separó en un archivo propio en este ticket por
+no ser parte de su alcance, señalado aquí por si vale la pena un ticket
+chico aparte.
 
 **CLI `sonar` reconfigurado, con límite real descubierto y verificado en
 vivo**: el CLI `sonar` (SonarQube CLI v1.6.0, no el `sonar-scanner`
@@ -456,4 +480,57 @@ de negocio (ticket 011 propio de ese repo, sin empezar):
   o el trigger periódico (~4h). Verificado con evidencia real que hoy
   `docker exec jenkins ls jobs/64bitstudio/jobs/` NO incluye
   `mail-core-mc` todavía.
+
+### 12. Hallazgo real (2026-09-01): el vhost y el healthcheck no funcionaban desde el contenedor de Jenkins
+
+Encontrado en el PRIMER deploy real a DEV de `auth-core-mc` tras
+mergear los puntos 3/4 (build #8, ver PRs `platform#5`/
+`auth-core-mc#83`) -- exactamente el escenario que este ticket pedía
+verificar "de punta a punta", y que reveló un supuesto roto al mover
+lógica de `ci.yml` (ejecutada DIRECTO sobre el host de la VM por el
+runner self-hosted) a la Shared Library (ejecutada DENTRO del
+contenedor de Jenkins, `agent any` = el propio controller).
+
+**Bug 1, el que rompió el build**: el stage "Vhost de nginx (dev)"
+fallaba con `sudo: not found`. Ni instalar `sudo` habría alcanzado --
+seguiría sin ver `/etc/nginx` ni el systemd reales del host (namespaces
+distintos). Solución: nueva imagen `platform-host-exec`
+(`deploy/vm-infra/jenkins/host-exec/`, alpine + `util-linux`, entrypoint
+`nsenter --target 1 --mount --uts --ipc --net --pid --`), lanzada por la
+Shared Library vía `docker.sock` (que Jenkins ya monta, mismo modelo de
+confianza ya aceptado y documentado en su propio `docker-compose.yml`)
+con acceso elevado y PID compartido con el host -- re-ejecuta el
+comando dado DENTRO de los namespaces reales de PID 1, así que
+`systemctl reload nginx` desde ahí sí recarga el nginx real de la VM,
+no uno de un contenedor. Se agregó el build de esta imagen a
+`sync-vm-infra`.
+
+**Bug 2, encontrado al revisar el resto del pipeline por el mismo
+motivo (no solo el reportado)**: el healthcheck de `deployAndVerify()`
+usaba `curl http://localhost:<puerto>` -- ese `localhost` es el
+loopback DEL CONTENEDOR DE JENKINS, no del host, nunca iba a alcanzar
+el puerto publicado del contenedor de la app. Verificado en vivo:
+
+```
+docker exec jenkins curl http://localhost:8081/actuator/health        -> 000
+docker exec jenkins curl http://auth-core-mc-dev-app-1:8080/actuator/health -> 200 UP
+```
+
+Jenkins y el contenedor de cada app comparten la red `edge` -- se
+cambió el healthcheck a pegarle al contenedor por su NOMBRE
+(`<project>-<env>-app-1`, determinístico por cómo nombra sus
+contenedores Docker Compose) + su puerto INTERNO
+(`config.containerPort`, default `8080`, constante entre dev/qa/prod --
+reemplaza el `healthPorts` map de puertos publicados al host, que ya no
+aplica bajo este mecanismo).
+
+**No se pudo probar el mecanismo elevado de forma aislada vía SSH** --
+el clasificador de permisos del harness lo bloqueó al intentarlo
+directo desde la terminal (correcto que lo bloquee: es exactamente el
+tipo de acción -- lanzar un contenedor con acceso elevado y PID
+compartido con el host -- que merece ese filtro; el diseño en sí lo
+pidió explícitamente el Product Owner al revisar las opciones reales
+disponibles, dado que Jenkins ya tiene `docker.sock` montado). La
+verificación real es el siguiente deploy a `dev` con el fix aplicado --
+ver PRs `platform#6`/`auth-core-mc#84`.
 
