@@ -60,6 +60,13 @@ services:
       SONAR_TOKEN: ${SONAR_TOKEN:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # Ticket 004: SecretID del AppRole "jenkins-infra" -- el único
+      # bootstrap secret que sigue fuera de Vault por diseño (ver
+      # docs/definiciones/vault-secrets-manager-vm.md). Vive en el
+      # credential store de Jenkins (ver casc/jenkins.yaml,
+      # "vault-jenkins-secret-id"), consumido por
+      # vars/corePipeline.groovy en cada deploy.
+      VAULT_JENKINS_SECRET_ID: ${VAULT_JENKINS_SECRET_ID:-}
     volumes:
       - jenkins_home:/var/jenkins_home
       - /var/run/docker.sock:/var/run/docker.sock

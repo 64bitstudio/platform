@@ -94,6 +94,27 @@
 //      red "edge" (verificado en vivo: docker exec jenkins curl
 //      http://auth-core-mc-dev-app-1:8080/actuator/health -> 200 UP).
 
+import groovy.transform.Field
+
+// Ticket platform/004 (docs/definiciones/vault-secrets-manager-vm.md,
+// HU-3): RoleID del AppRole "jenkins-infra" -- NO es secreto por diseño
+// (ver el documento de definición, "AppRole para Jenkins"), por eso vive
+// hardcodeado aquí en vez de en un archivo/credential. El SecretID (el
+// único bootstrap secret que sigue fuera de Vault) vive en el
+// credential store de Jenkins, ver casc/jenkins.yaml
+// ("vault-jenkins-secret-id"). Generado en
+// deploy/vm-infra/vault/bootstrap-jenkins-approle.sh -- si ese AppRole
+// se recrea alguna vez (Vault reconstruido desde cero), este valor
+// cambia y hay que actualizarlo aquí también.
+//
+// @Field (no una asignación de nivel de script simple) -- es el patrón
+// correcto/documentado para una constante a nivel de script en un
+// archivo vars/*.groovy de una Shared Library de Jenkins; una
+// asignación bare aquí puede comportarse de forma inconsistente entre
+// el binding del script y los métodos top-level que la usan bajo CPS.
+@Field
+String JENKINS_VAULT_APPROLE_ROLE_ID = '36a9755d-af3c-c050-2b78-5126cc829791'
+
 def call(Map config) {
     if (!config.projectName) {
         error("corePipeline: falta config.projectName")
@@ -104,6 +125,12 @@ def call(Map config) {
     def containerPort = config.containerPort ?: 8080
     def healthPath = config.healthPath ?: '/actuator/health'
     def healthyPattern = config.healthyPattern ?: '"status":"UP"'
+    // Ticket 004: por default, cualquier core con deploy real (doDeploy
+    // true) obtiene su DB_PASSWORD de Vault automáticamente -- sin tocar
+    // su propio Jenkinsfile, mismo principio que el resto de esta
+    // librería. Escape hatch explícito (no silencioso) para el caso
+    // excepcional de un core que todavía no migró su secreto a Vault.
+    def skipVaultSecrets = config.skipVaultSecrets ?: false
 
     pipeline {
         agent any
@@ -227,6 +254,9 @@ def call(Map config) {
                 when { allOf { branch 'dev'; expression { return doDeploy } } }
                 steps {
                     script {
+                        if (!skipVaultSecrets) {
+                            fetchAndPatchDbPasswordFromVault(project, 'dev')
+                        }
                         deployAndVerify(project, 'dev', "${project}:${env.GIT_SHA}", env.GIT_SHA, containerPort, healthPath, healthyPattern)
                     }
                 }
@@ -242,6 +272,9 @@ def call(Map config) {
                         ).trim()
                         if (!env.QA_SHA) {
                             error("No se encontró ${project}-dev:current -- ¿corrió el deploy a DEV alguna vez?")
+                        }
+                        if (!skipVaultSecrets) {
+                            fetchAndPatchDbPasswordFromVault(project, 'qa')
                         }
                         deployAndVerify(project, 'qa', "${project}-dev:current", env.QA_SHA, containerPort, healthPath, healthyPattern)
                     }
@@ -278,6 +311,9 @@ def call(Map config) {
                 }
                 steps {
                     script {
+                        if (!skipVaultSecrets) {
+                            fetchAndPatchDbPasswordFromVault(project, 'prod')
+                        }
                         deployAndVerify(project, 'prod', "${project}-qa:current", env.QA_SHA, containerPort, healthPath, healthyPattern)
 
                         // Registro en git: la rama `prod` avanza al mismo commit
@@ -311,6 +347,62 @@ def call(Map config) {
                 }
             }
         }
+    }
+}
+
+// Ticket platform/004 (HU-1 completa, HU-3, HU-4): obtiene DB_PASSWORD
+// de Vault (secret/<project>/<envName>, motor KV v2) vía el AppRole
+// "jenkins-infra" (login de vida corta -- token_ttl=15m, nunca un token
+// maestro de larga duración) y lo escribe en el archivo REAL del host
+// (/home/ubuntu/secrets/<project>/.env.<envName>), que es lo que
+// deployAndVerify usa como --env-file. A partir de este ticket, Vault
+// es la fuente de verdad -- el archivo queda como artefacto renderizado
+// en cada deploy (HU-1), nunca editado a mano.
+//
+// El valor del secreto NUNCA se vuelve una variable de Groovy ni pasa
+// por "echo" -- fluye completo dentro de un solo pipeline de shell
+// (curl a Vault -> jq -> stdin de host-exec), igual que el patrón ya
+// usado para el token root en la migración inicial (ver
+// docs/ARQUITECTURA.md ticket 004). "jq" se agrega en el Dockerfile de
+// Jenkins para esto -- no había necesidad de parsear JSON dentro de un
+// step de pipeline hasta este ticket.
+//
+// El SecretID del AppRole (el único bootstrap secret fuera de Vault por
+// diseño, ver el documento de definición) se inyecta vía el credential
+// "vault-jenkins-secret-id" (ver casc/jenkins.yaml) -- masked
+// automáticamente por credentials-binding en cualquier log de consola.
+//
+// Rollback real (HU-4): si Vault está sellado/inalcanzable o el
+// secreto no existe todavía para este proyecto/ambiente, el step
+// falla ruidosamente ANTES de tocar el archivo real -- el .env
+// existente (con el valor anterior) queda intacto, nunca se pisa con
+// un valor vacío/roto.
+def fetchAndPatchDbPasswordFromVault(project, envName) {
+    withCredentials([string(credentialsId: 'vault-jenkins-secret-id', variable: 'VAULT_SECRET_ID')]) {
+        sh """
+            set -euo pipefail
+            PAYLOAD=\$(jq -n --arg r "${JENKINS_VAULT_APPROLE_ROLE_ID}" --arg s "\$VAULT_SECRET_ID" '{role_id:\$r, secret_id:\$s}')
+            VAULT_TOKEN=\$(curl -sf -X POST http://vault:8200/v1/auth/approle/login -d "\$PAYLOAD" | jq -r '.auth.client_token // empty')
+            if [ -z "\$VAULT_TOKEN" ]; then
+                echo "No se pudo autenticar contra Vault (AppRole jenkins-infra) -- ¿está sellado/inalcanzable? No se toca el .env existente." >&2
+                exit 1
+            fi
+            curl -sf -H "X-Vault-Token: \$VAULT_TOKEN" http://vault:8200/v1/secret/data/${project}/${envName} \\
+                | jq -r '.data.data.DB_PASSWORD // empty' \\
+                | docker run --rm -i --privileged --pid=host platform-host-exec sh -c '
+                    NEWVAL=\$(cat)
+                    FILE=/home/ubuntu/secrets/${project}/.env.${envName}
+                    if [ -z "\$NEWVAL" ]; then
+                        echo "DB_PASSWORD vacío/no encontrado en Vault para ${project}/${envName} -- abortando sin tocar el archivo." >&2
+                        exit 1
+                    fi
+                    if [ ! -f "\$FILE" ]; then
+                        echo "\$FILE no existe -- no se puede parchear un archivo que no existe (ver rollback HU-4)." >&2
+                        exit 1
+                    fi
+                    sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=\$NEWVAL|" "\$FILE"
+                '
+        """
     }
 }
 

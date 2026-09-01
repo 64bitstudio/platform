@@ -12,9 +12,12 @@ FROM jenkins/jenkins:lts-jdk21
 USER root
 
 # docker-ce-cli (el CLI, no el daemon -- el daemon real es el de la VM,
-# alcanzado vía el socket montado) + el plugin de compose v2.
+# alcanzado vía el socket montado) + el plugin de compose v2 + jq
+# (ticket 004: vars/corePipeline.groovy usa jq para parsear las
+# respuestas JSON de la API de Vault dentro de un step "sh" -- más
+# simple que sumar un plugin de Jenkins solo para parsear JSON).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg jq \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
     && chmod a+r /etc/apt/keyrings/docker.gpg \
