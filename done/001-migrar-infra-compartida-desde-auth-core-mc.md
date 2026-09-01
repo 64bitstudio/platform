@@ -61,12 +61,12 @@ mantenimiento que se aplicó al ticket 049/050.
 - Migrar `mail-core-mc` — no existe todavía.
 
 ## Pendiente de una acción directa de Marco
-- Actualizar la fuente (`docker compose -f ...`) que corre en la VM
-  para que el runner de GitHub Actions apunte al checkout de ESTE repo
-  en vez de `auth-core-mc` para los pasos de infra compartida — el
-  agente debe dejar el comando exacto, probablemente bloqueado para él
-  por el mismo clasificador del harness que ya conocemos de sesiones
-  anteriores.
+~~Actualizar la fuente que corre en la VM para que el runner apunte al
+checkout de este repo~~ — no hizo falta ninguna acción manual: el
+runner self-hosted `vm-oci` está registrado a nivel de organización
+(`enabled_repositories: all`), así que tomó el checkout de `platform`
+solo, sin registro adicional — confirmado en la verificación de punta
+a punta de abajo.
 
 ## Criterios de aceptación
 - Dado un push a este repo (rama principal), cuando corre su CI,
@@ -84,3 +84,45 @@ mantenimiento que se aplicó al ticket 049/050.
   `64bitstudio`, cuando termine este ticket, entonces sigue
   descubriendo `auth-core-mc` (y `mail-core-mc` a futuro) sin cambios —
   este ticket no debe romper el pipeline de aplicación de ningún core.
+
+## Hecho
+
+Cerrado 2026-08-31. `platform` PR #1 (commit `6b8fc2f`) y
+`auth-core-mc` PR #82 (commit `b1c3853`), ambos mergeados. Todos los
+criterios de aceptación verificados con evidencia real (no solo "el
+job pasó"):
+
+- **Datos intactos**: Jenkins conserva el job `64bitstudio/auth-core-mc`;
+  SonarQube conserva el usuario `marco`; volumen de Jenkins sin
+  recrear desde cero.
+- **4 subdominios responden con el backend real** (SonarQube 200,
+  Portainer 200, Traefik dashboard 302→`/dashboard/`, Jenkins 403 de
+  su propia seguridad), TLS Let's Encrypt vigente en los 4;
+  `auth.64bitstudio.com` (específico de `auth-core-mc`) sin afectar.
+- **`paths-ignore: ['docs/**']` confirmado 3 veces**: tres pushes
+  solo-`docs/` → 0 check-runs, vs. el push con cambios reales que sí
+  disparó `sync-vm-infra` (18/18 pasos verdes).
+- **14 archivos migrados byte-idénticos** al contenido real de
+  `auth-core-mc@dev` antes de la migración.
+- `auth-core-mc/.github/workflows/ci.yml` retirado por completo (ya no
+  le quedaba ningún job); `docs/ARQUITECTURA.md` de ese repo con nota
+  explícita de que la infra compartida se movió aquí, sin borrar la
+  historia de los tickets 049/050.
+
+**Hallazgo real, documentado, no bloqueante**: el primer push a este
+repo recreó el contenedor de Jenkins (el bind-mount resuelve por ruta
+absoluta del checkout, que cambió de repo) mientras un build del PR
+gemelo en `auth-core-mc` corría — lo mató por timeout de heartbeat, sin
+error real de código (0 fallos de compilación/tests). Se resolvió
+reintentando ese build. El riesgo de fondo (recrear Jenkins puede matar
+cualquier build concurrente de cualquier core) es real y general — no
+resuelto en este ticket, candidato a ticket futuro (chequear si hay un
+build activo antes de recrear el contenedor).
+
+**Pendiente explícito, fuera de este ticket**: al retirar `ci.yml` de
+`auth-core-mc`, el vhost `auth-core-mc.conf` y su certificado quedaron
+sin ningún job que los reaplique si cambiaran (la renovación automática
+del certificado sí sigue funcionando vía `certbot.timer` del sistema,
+verificada). Si `auth-core-mc.conf` necesita cambiar en el futuro, hace
+falta decidir un mecanismo nuevo — señalado a propósito, no resuelto
+aquí.
