@@ -84,7 +84,21 @@ SonarQube de la VM y al `Jenkinsfile`+Shared Library — **este punto lo
 hace Claude directamente, no el agente de DevOps** (no es infra de
 ningún repo).
 
-**10. Caso de prueba real: dejar `mail-core-mc` listo para arrancar**
+**10. SonarQube duplicado en la Mac de Marco — retirar**
+`docker ps` en la Mac muestra `sonarqube`/`sonarqube-db` corriendo
+(9+ días de uptime) — el que debía haberse retirado por completo al
+migrar a la VM (ver memoria `vm-deploy-infra-roadmap`). Nada le apunta
+ya para CI real, pero sigue consumiendo recursos de la Mac sin
+propósito. Apagarlo/retirarlo (`docker compose down`, confirmar que no
+hay volúmenes con datos que Marco quiera conservar antes). Además, el
+CLI `sonar` de la Mac (`~/dev-infra/.env`, `SONAR_HOST_URL=
+http://localhost:9000`) apunta a esa instancia local — ajustarlo para
+apuntar al SonarQube real de la VM (vía `sonarqube.64bitstudio.com`,
+verificando si el CLI soporta pasar las credenciales de Basic Auth de
+nginx además del token de Sonar, o si hace falta otro mecanismo como
+un túnel SSH persistente) antes de dar este punto por cerrado.
+
+**11. Caso de prueba real: dejar `mail-core-mc` listo para arrancar**
 Aplicar el runbook completo (puntos 3-8) a `mail-core-mc` — no su
 pipeline de aplicación en sí (eso es su propio ticket 011, sin
 empezar), solo la parte de infra: ramas, branch protection, webhook,
@@ -121,3 +135,7 @@ verificar cada paso con evidencia real.
   negocio real sea mínima/placeholder, ese es alcance del ticket 011).
 - Dado el skill `bootstrap-proyecto` corregido, entonces ya no
   menciona Sonar en la Mac ni "copiar workflow de GitHub Actions".
+- Dado el SonarQube local de la Mac, cuando se retira, entonces
+  `docker ps` en la Mac ya no lo muestra, y el CLI `sonar` funciona
+  contra el de la VM (verificado con un comando real, no solo
+  configurado).
