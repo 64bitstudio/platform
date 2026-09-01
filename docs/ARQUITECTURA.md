@@ -1285,3 +1285,97 @@ incorrecto -- señalado a Marco como pregunta aparte, pendiente de su
 respuesta. Sin impacto práctico inmediato: el `SONAR_TOKEN` de Jenkins
 ya migró a Vault con un valor real (ver arriba), este paso de
 auto-generación solo importaría en un rebuild desde cero de la VM.
+
+## Ticket 005 (2026-09-01, EN PROGRESO): AppRole del backend de auth-core-mc para Transit
+
+Deriva de `docs/definiciones/vault-secrets-manager-vm.md` (VoBo Marco
+2026-09-01). Implementa HU-7 completa. Toca dos repos: `platform`
+(PR #19, ya mergeado -- policy/AppRole de Vault) y `auth-core-mc`
+(PR #88, ya mergeado -- `VaultTransitEncryptor` usa AppRole en vez de
+token estático).
+
+### Deploy real a DEV verificado (build #13, commit `f72c1392`)
+
+- `Finished: SUCCESS`, contenedor `auth-core-mc-dev-app-1` `Up ...
+  (healthy)`.
+- `VAULT_SECRET_ID` real parcheado en
+  `/home/ubuntu/secrets/auth-core-mc/.env.dev` -- confirmado no vacío,
+  `mtime` coincidente con la ventana del build.
+- **Cero ocurrencias de `X-Vault-Token`** en el log completo del build
+  -- el fix de `set +x` (ticket 004) sigue funcionando también para
+  este nuevo consumidor.
+- `VAULT_ADDR`/`VAULT_ROLE_ID`/`VAULT_TRANSIT_KEY_NAME` confirmados con
+  valores reales (no vacíos) en los 3 `.env.{dev,qa,prod}` de la VM --
+  puestos a mano una sola vez (hallazgo real: un env var Docker
+  presente-pero-vacío hace que Spring NO caiga al default de
+  `application.properties`, a diferencia de un env var ausente --
+  documentado en el propio `application.properties`).
+
+### Verificación end-to-end real en DEV: un tenant configura un `client_secret` de verdad
+
+**Hallazgo real, necesario antes de poder probar esto**: la base de
+datos de DEV estaba completamente vacía (cero tenants, cero usuarios)
+-- y crear tanto un tenant como un `IdentityClient` requiere ya tener
+un admin (`AdminTenantController`, admin-only), y no existe ningún
+mecanismo de bootstrap/seed de un primer admin en el código (sin
+migración de datos semilla, confirmado revisando
+`V3__admin_panel_role.sql`). Mismo límite estructural que ya
+documentaron tickets anteriores de este repo (ver, p. ej., ticket 026:
+"el agente encontró un límite real de permisos al intentar fabricar
+una sesión de `platform_admin`... y correctamente se detuvo"). Se
+replicó el mismo patrón ya establecido (ticket 031, usuario
+`qa-visual-031@example.com`): registrar un usuario real vía la API
+pública (hash de password generado correctamente por la app misma, sin
+fabricarlo a mano) y promoverlo con **una sola** escritura directa a
+BD, acotada a ese usuario de prueba específico -- no un bypass general.
+
+Pasos reales ejecutados en DEV (base de datos y API real de la VM, sin
+mocks):
+1. `INSERT` de un tenant de prueba (`ticket-005-e2e-verification`) y un
+   `IdentityClient` first-party (`ticket-005-e2e-client`) -- estructura
+   mínima, sin secretos.
+2. `POST /api/v1/register` real (hash de password generado por la app).
+3. **Una** escritura directa: `UPDATE app_user SET role='TENANT_ADMIN'
+   WHERE id=...` sobre ese único usuario de prueba.
+4. `POST /api/v1/login` real -> JWT real (`accessToken`/`tokens`).
+5. `PUT /api/v1/admin/identity-providers/GOOGLE` real, con un
+   `clientSecret` de prueba -> **`HTTP 200`**.
+6. Confirmado en la base real: `tenant_identity_provider.client_secret_encrypted`
+   contiene ciphertext real (`MZnvpfjuyTspc41+PbiXTwdXV37u9PjFXJaE0JVV...`,
+   96 caracteres) -- **no** el texto plano del secreto -- prueba de que
+   el cifrado ocurrió de verdad, no un no-op silencioso.
+
+**Por qué esto prueba encrypt Y decrypt, no solo encrypt**: `TenantSecretEncryptor.encrypt()`
+llama primero a `unwrapDataKey()` (que llama a
+`vaultTransitEncryptor.unwrap()`) para obtener la data-key en claro de
+ese tenant, y solo después cifra el secreto localmente con ella -- así
+que ese único `HTTP 200` ya demuestra que **ambas** operaciones de
+Transit (`wrap`, al crear la data-key del tenant por primera vez, y
+`unwrap`, dentro de la misma llamada) funcionaron de verdad contra el
+Vault real de la VM, vía la AppRole `auth-core-mc-backend`, en el
+ambiente real desplegado -- exactamente lo que HU-7 pide para DEV.
+
+JWT y respuestas HTTP con tokens nunca quedaron en ningún archivo
+persistente -- generados y usados dentro de una sola sesión SSH,
+borrados (`shred -u`) al terminar.
+
+**El tenant/usuario de prueba se dejaron en la base de DEV a
+propósito** (no se borraron) -- reutilizables para verificaciones
+futuras, mismo criterio que `qa-visual-031@example.com` en ticket 031.
+
+### Pendiente: QA y PROD
+
+Criterio de aceptación del ticket ("probado de verdad en los tres
+ambientes, no asumido por similitud con DEV") -- **no se da por
+cumplido en QA/PROD todavía**, señalado explícitamente, no asumido.
+Bloqueado en dos acciones exclusivas de Marco (ver el mensaje
+correspondiente en el hilo de la sesión para el detalle completo):
+
+1. Promover `dev` -> `qa` de `auth-core-mc` (dispara el deploy
+   automático a QA) -- exclusivo de Marco, no una decisión ni una
+   acción de este agente.
+2. Tras verificar QA, aprobar el gate manual de PROD en la propia UI de
+   Jenkins (`input` step, `submitter: 'marco'`, hasta 7 días de
+   espera) -- una acción de clic en la UI, no un comando de terminal;
+   sin credencial de API de Jenkins disponible para este agente (ver
+   ticket 049).
