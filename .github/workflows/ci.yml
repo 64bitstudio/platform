@@ -218,18 +218,35 @@ jobs:
       # cambiado Dockerfile/plugins.txt (basta con que cambie algo de su
       # config real, p.ej. la ruta absoluta del bind mount de casc/ --
       # exactamente lo que pasó). Antes de tocar el contenedor, se espera
-      # a que Jenkins NO tenga ningún build corriendo un paso de verdad
-      # ahora mismo -- sin usar la API HTTP de Jenkins (que exige login,
-      # gestionado 100% por UI desde el ticket 049 y no disponible aquí
-      # sin credenciales nuevas): se lee directo el build.xml de cada
-      # build en jenkins_home vía "docker exec" (no requiere auth). Un
-      # build "no completado" (build.xml sin <result>) por sí solo NO
-      # basta -- el stage "¿Promover a PROD?" puede quedar pausado hasta
-      # 7 días esperando el clic de Marco, sosteniendo su executor sin
-      # ejecutar nada; eso NO debe bloquear la recreación. Se distingue
-      # con el mtime del log: si cambió en los últimos 30s, hay un paso
-      # ejecutando algo de verdad ahora mismo.
-      - name: Esperar si Jenkins tiene un build activo antes de recrearlo
+      # a que Jenkins NO tenga ningún paso "sh" ejecutando un proceso de
+      # verdad ahora mismo -- sin usar la API HTTP de Jenkins (que exige
+      # login, gestionado 100% por UI desde el ticket 049, sin credencial
+      # disponible aquí).
+      #
+      # Iteración real de este mecanismo, verificada en vivo (no solo en
+      # el código, ver docs/ARQUITECTURA.md): la primera versión leía
+      # <result> en el build.xml de cada build, asumiendo que solo
+      # aparece al terminar -- FALSO en esta versión de Jenkins, aparece
+      # (con valor SUCCESS por default) desde el primer instante del
+      # build, volviendo el chequeo un no-op. Tampoco basta con el mtime
+      # del log: "./gradlew test" no imprime nada mientras corren los
+      # tests (más de 100s de silencio observados en un build real), así
+      # que un umbral de "sin output reciente" también da falso negativo
+      # a mitad de un build genuinamente activo.
+      #
+      # Señal real que sí funciona (confirmada en vivo, aparece exacto al
+      # iniciar un paso "sh" y desaparece exacto al terminar, sin importar
+      # si produce output): el directorio de control que el plugin
+      # durable-task crea por cada paso "sh" en ejecución
+      # (<workspace-o-subdir>@tmp/durable-<id>/) -- estado interno del
+      # plugin, no del log ni del build.xml, así que no depende de qué
+      # tan silencioso sea el comando. No existe durante un "input"
+      # pausado (como el gate de prod, hasta 7 días) ni durante
+      # waitForQualityGate -- ninguno de los dos sostiene un proceso real
+      # que una recreación del contenedor pudiera matar (son estado CPS
+      # puro, sobreviven un restart de Jenkins), así que correctamente NO
+      # bloquean la recreación.
+      - name: Esperar si Jenkins tiene un paso "sh" activo antes de recrearlo
         run: |
           if ! docker ps --format '{{.Names}}' | grep -qx jenkins; then
             echo "Jenkins no está corriendo todavía (primer bootstrap) -- nada que esperar."
@@ -238,25 +255,16 @@ jobs:
           MAX_WAIT=600
           WAITED=0
           while true; do
-            ACTIVE=$(docker exec jenkins sh -c '
-              for b in $(find /var/jenkins_home/jobs -mindepth 5 -maxdepth 5 -type d -regex ".*/builds/[0-9]+$" 2>/dev/null); do
-                [ -f "$b/build.xml" ] || continue
-                grep -q "<result>" "$b/build.xml" && continue
-                [ -f "$b/log" ] || continue
-                if [ $(( $(date +%s) - $(stat -c %Y "$b/log") )) -lt 30 ]; then
-                  echo "$b"
-                fi
-              done
-            ' 2>/dev/null | head -1)
+            ACTIVE=$(docker exec jenkins sh -c "find /var/jenkins_home/jobs -type d -name 'durable-*' -path '*@tmp*' 2>/dev/null" | head -1)
             if [ -z "$ACTIVE" ]; then
-              echo "Sin build activo -- seguro recrear Jenkins si hace falta."
+              echo "Sin ningún paso 'sh' activo -- seguro recrear Jenkins si hace falta."
               break
             fi
             if [ "$WAITED" -ge "$MAX_WAIT" ]; then
-              echo "::warning::Build activo ($ACTIVE) tras ${MAX_WAIT}s de espera -- se procede de todas formas (excepción conocida, no un silencio: un build real no debería tardar tanto; si esto se repite, investigar por qué)."
+              echo "::warning::Paso 'sh' activo ($ACTIVE) tras ${MAX_WAIT}s de espera -- se procede de todas formas (excepción conocida, no un silencio: un paso real no debería tardar tanto; si esto se repite, investigar por qué)."
               break
             fi
-            echo "Build activo ($ACTIVE) -- esperando 20s antes de reintentar ($WAITED/${MAX_WAIT}s)..."
+            echo "Paso 'sh' activo ($ACTIVE) -- esperando 20s antes de reintentar ($WAITED/${MAX_WAIT}s)..."
             sleep 20
             WAITED=$((WAITED + 20))
           done
