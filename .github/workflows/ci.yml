@@ -156,6 +156,52 @@ jobs:
       - name: Portainer (dashboard de Docker/Compose, compartido de la VM)
         run: docker compose -f deploy/vm-infra/portainer/docker-compose.yml up -d
 
+      # Ticket 003 (docs/definiciones/vault-secrets-manager-vm.md): Vault
+      # Community Edition, fuente única de secretos de infra + motor
+      # Transit -- compartido de la VM, mismo patrón idempotente que
+      # SonarQube/Portainer arriba (imagen oficial, sin build propio, "up
+      # -d" no hace nada si no cambió nada real). Requiere que el Dynamic
+      # Group + Policy de OCI IAM ya existan (ver docs/ARQUITECTURA.md,
+      # "Vault -- OCI KMS auto-unseal") -- si no existen todavía, el
+      # contenedor arranca pero queda en crash-loop esperando poder
+      # autenticarse contra OCI KMS (falla explícito en sus logs, nunca
+      # en silencio) hasta que Marco los cree.
+      - name: Vault (secrets manager compartido de la VM)
+        run: docker compose -f deploy/vm-infra/vault/docker-compose.yml up -d
+
+      # Ticket 003: motor Transit + la llave que auth-core-mc ya espera
+      # (VAULT_TRANSIT_KEY_NAME), como paso idempotente de CI en vez de
+      # un comando manual que solo "corrió una vez" -- mismo criterio de
+      # reproducibilidad que ya usa el bootstrap de SONAR_TOKEN más abajo.
+      # Usa el token root que vive en /home/ubuntu/secrets/vault/
+      # init-output.json (fuera de git, permisos 600, generado por
+      # `vault operator init` -- ver docs/ARQUITECTURA.md ticket 003) --
+      # si ese archivo no existe todavía (Vault sin `operator init` por
+      # Marco), el paso se omite con un aviso explícito, nunca falla en
+      # silencio ni bloquea el resto de sync-vm-infra.
+      - name: Asegurar motor Transit + llave auth-core-mc-tenant-keys en Vault (si falta)
+        run: |
+          TOKEN_FILE=/home/ubuntu/secrets/vault/init-output.json
+          if [ ! -f "$TOKEN_FILE" ]; then
+            echo "::warning::$TOKEN_FILE no existe todavía -- Vault sin 'vault operator init' (paso manual de Marco, ver docs/ARQUITECTURA.md ticket 003). Se omite este paso, no es un fallo del pipeline."
+            exit 0
+          fi
+          TOKEN=$(python3 -c "import json;print(json.load(open('$TOKEN_FILE'))['root_token'])")
+          if ! docker exec -e VAULT_TOKEN="$TOKEN" vault vault status >/dev/null 2>&1; then
+            echo "::warning::Vault no responde o sigue sellado -- se omite este paso (ver alerta de Telegram si HU-8 ya está activa)."
+            exit 0
+          fi
+          if docker exec -e VAULT_TOKEN="$TOKEN" vault vault secrets list -format=json | python3 -c "import json,sys; exit(0 if 'transit/' in json.load(sys.stdin) else 1)"; then
+            echo "transit ya estaba habilitado."
+          else
+            docker exec -e VAULT_TOKEN="$TOKEN" vault vault secrets enable transit
+          fi
+          if docker exec -e VAULT_TOKEN="$TOKEN" vault vault read transit/keys/auth-core-mc-tenant-keys >/dev/null 2>&1; then
+            echo "la llave auth-core-mc-tenant-keys ya existía."
+          else
+            docker exec -e VAULT_TOKEN="$TOKEN" vault vault write -f transit/keys/auth-core-mc-tenant-keys
+          fi
+
       # Bootstrap idempotente de /home/ubuntu/secrets/jenkins/.env (nunca
       # lo pisa si ya existe con un password real puesto por Marco).
       - name: Asegurar /home/ubuntu/secrets/jenkins/.env (si falta)
