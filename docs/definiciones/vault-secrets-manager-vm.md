@@ -1,23 +1,42 @@
 # Definición: Vault como secrets manager general de la VM compartida
 
+**Reformulado 2026-09-01** — versión original del 2026-08-31, revisada
+tras el ticket `platform/002` (endurecimiento de la infra base) y el
+resize real de la VM. Se conserva el diseño central (Vault + auto-unseal
+vía OCI KMS + AppRole), actualizado contra lo que hoy existe de verdad
+— ver "Qué cambió desde la versión original" al final antes de pedir
+VoBo de nuevo.
+
 ## Resumen ejecutivo
 Hoy los secretos de infra de la VM (OCI Ampere A1, compartida entre
-`auth-core-mc` y, más adelante, `mail-core-mc`) viven repartidos en
-archivos sueltos (`/home/ubuntu/secrets/*`, `/etc/nginx/secrets/`,
-GitHub Actions Secrets), generados ad hoc, sin rotación ni auditoría.
-Este cambio instala un **Vault nuevo y dedicado** en la propia VM como
-fuente única de esos secretos, con **auto-unseal vía OCI KMS** (para
-que sobreviva un reinicio sin intervención manual) y **AppRole** como
-método de autenticación de Jenkins/CI — reemplazando los archivos
-sueltos como fuente de verdad, sin cambiar cómo Jenkins/nginx los
-*consumen* en el último tramo (siguen llegando como archivo/env var en
-el momento del deploy).
+`auth-core-mc`, `mail-core-mc` — ya conectado a la infra común vía el
+ticket 002 — y cualquier core futuro) viven repartidos en archivos
+sueltos (`/home/ubuntu/secrets/*`, `/etc/nginx/secrets/`, GitHub
+Actions Secrets, el credential store de Jenkins), generados ad hoc, sin
+rotación ni auditoría — y con un hallazgo real reciente que refuerza el
+problema: el PAT de GitHub compartido (git, `gh` CLI, Jenkins) tiene
+permisos de administrador que le permiten saltarse branch protection,
+más privilegio del necesario para su uso cotidiano (ver
+`platform/done/002-...md`, incidente del push directo). Este cambio
+instala un **Vault nuevo y dedicado** en la propia VM (repo `platform`,
+igual que el resto de la infra compartida) como fuente única de esos
+secretos, con **auto-unseal vía OCI KMS** y **AppRole** como método de
+autenticación de Jenkins/CI — integrado directamente en la Shared
+Library (`vars/corePipeline.groovy`, construida en el ticket 002), así
+que **todo core que ya use esa librería queda cubierto automáticamente**,
+sin trabajo adicional por proyecto — coherente con el principio de
+"máxima automatización" que Marco confirmó para toda la infra.
 
-Incluye también, como prerrequisito, el **resize de la VM** de 2
-OCPU/12GB a 4 OCPU/24GB dentro del tier Always Free de OCI (Ampere A1
-permite hasta 4 OCPU/24GB repartibles entre instancias) — Marco decidió
-seguir por esta vía sabiendo el tradeoff de recursos de un proceso más
-corriendo en la máquina, con intención de revisarlo más adelante.
+**El resize de la VM que este documento pedía como prerrequisito ya
+está hecho** (2026-09-01): 2 OCPU/12GB → 4 OCPU/24GB, dentro de Always
+Free, aplicado y verificado con un reinicio real de la VM — los 13
+contenedores existentes y el runner volvieron solos, sin intervención
+manual (ver `platform/done/002-...md`, punto 2). Ya no es parte del
+alcance de este documento, es contexto ya resuelto: Vault se instala
+sobre una VM con el doble de recursos que cuando se escribió la primera
+versión de este documento, lo que reduce bastante el riesgo de CPU/
+memoria que antes era la preocupación principal de sumar un proceso
+más.
 
 ## Objetivo de negocio
 Eliminar el manejo manual/ad hoc de secretos de infra (generación
@@ -38,9 +57,11 @@ No hay roles humanos nuevos — sigue siendo un equipo de una persona.
 ## Alcance
 
 ### Incluye
-- Vault OSS nuevo, contenedor Docker en la VM, storage backend **Raft
-  integrado** (modo single-node, sin depender de un backend externo,
-  compatible con sumar nodos más adelante sin migrar de backend).
+- Vault OSS nuevo, contenedor Docker en la VM (`platform/deploy/
+  vm-infra/vault/`, mismo patrón que Traefik/SonarQube/Jenkins/
+  Portainer), storage backend **Raft integrado** (modo single-node, sin
+  depender de un backend externo, compatible con sumar nodos más
+  adelante sin migrar de backend).
 - **Auto-unseal vía OCI KMS** — Vault se desella solo al arrancar,
   usando una clave de OCI KMS (mismo proveedor cloud que ya aloja la
   VM, no se suma un tercero nuevo).
@@ -48,14 +69,17 @@ No hay roles humanos nuevos — sigue siendo un equipo de una persona.
   que su pipeline necesita, nunca el árbol completo de secretos).
 - **AppRole** como método de autenticación de Jenkins contra Vault
   (RoleID + SecretID, tokens de vida corta — no un token maestro
-  estático).
-- Migración de los secretos ya existentes: `DB_PASSWORD` de
-  dev/qa/prod, PAT de GitHub, `SONAR_TOKEN`, tokens de Telegram, hash
-  del Basic Auth de nginx — uno a la vez, empezando por DEV (el de
-  menor riesgo), verificando cada paso antes de seguir.
-- El **resize de la VM** a 4 OCPU/24GB (prerrequisito, antes de sumar
-  Vault) — con ventana de mantenimiento planeada, dado que PROD vive en
-  la misma máquina.
+  estático), **integrado en `vars/corePipeline.groovy`** (la Shared
+  Library del ticket 002) como un step reusable — cualquier core que
+  ya invoque la librería (`auth-core-mc`, `mail-core-mc`, futuros) lo
+  hereda automáticamente, sin tocar su propio `Jenkinsfile` más allá de
+  declarar qué paths de secretos necesita.
+- Migración de los secretos ya existentes: `DB_PASSWORD` de cada
+  ambiente de cada core, el PAT de GitHub y `SONAR_TOKEN`/tokens de
+  Telegram de Jenkins (`/home/ubuntu/secrets/jenkins/.env`), y el hash
+  del Basic Auth de nginx (`/etc/nginx/secrets/vm-admin-tools.htpasswd`)
+  — uno a la vez, empezando por DEV de `auth-core-mc` (el de menor
+  riesgo), verificando cada paso antes de seguir.
 - Respaldo manual de las unseal keys (Shamir) en el gestor de
   contraseñas de Marco, como red de seguridad si el auto-unseal de OCI
   KMS llegara a fallar.
@@ -74,11 +98,20 @@ No hay roles humanos nuevos — sigue siendo un equipo de una persona.
 - Alta disponibilidad real (múltiples nodos de Vault) — sigue siendo
   single-node; el diseño con Raft lo deja preparado para eso, pero no
   se implementa ahora.
-- Migrar el ticket gemelo `mail-core-mc` a este Vault — lo hereda
-  cuando arranque su propio ticket 011, no es parte de este cambio.
+- Migrar los secretos específicos de `mail-core-mc` (ya conectado a la
+  infra vía la Shared Library desde el ticket 002, pero su lógica de
+  negocio real — y por lo tanto sus secretos reales — es su propio
+  ticket 011, sin empezar) — lo hereda gratis en cuanto Vault esté
+  listo para `auth-core-mc`, no hace falta trabajo extra por proyecto.
 - Vault gestionando su propia credencial de acceso humano (login de
   Jenkins vía UI, por ejemplo) — eso sigue siendo gestión local de cada
   herramienta, como ya se decidió para Jenkins en el ticket 049.
+- **Acotar los permisos del PAT de GitHub compartido** (hallazgo real
+  del ticket 002: puede saltarse branch protection) — es un cambio
+  relacionado pero independiente, ya anotado como candidato a ticket
+  futuro aparte; este documento no lo resuelve, aunque Vault sí sería
+  el lugar natural para guardar un PAT nuevo y acotado el día que se
+  cree.
 
 ## Historias de Usuario
 
@@ -149,21 +182,19 @@ Criterios de aceptación:
   (no se borra el archivo viejo hasta confirmar que Vault funciona de
   punta a punta para ese ambiente).
 
-### HU-5: VM redimensionada antes de sumar Vault
+### HU-5: VM redimensionada antes de sumar Vault — ✅ YA CUMPLIDA (2026-09-01)
 Como Product Owner, quiero que la VM tenga más recursos disponibles
 antes de sumarle un proceso más (Vault), para no agravar el problema de
 CPU ajustado que ya identificamos con Jenkins/SonarQube.
 
-Criterios de aceptación:
-- Dado el resize de 2 OCPU/12GB a 4 OCPU/24GB dentro de Always Free,
-  cuando se ejecuta, entonces se hace en una ventana de mantenimiento
-  avisada (PROD vive en la misma VM), confirmando primero si el
-  mecanismo de resize de OCI para esta shape requiere reinicio o es en
-  caliente (a verificar en la consola real de OCI antes de ejecutar, no
-  asumido en este documento).
-- Dado el resize completado, entonces se mide el uso real de
-  CPU/memoria de la VM (mismo criterio que se usó para medir antes de
-  instalar Jenkins) y se deja registrado en `docs/ARQUITECTURA.md`.
+Resuelta fuera de este documento, como parte de la verificación del
+ticket 002: resize a 4 OCPU/24GB aplicado por Marco vía la consola de
+OCI ("Edit instance"), y verificado con un reinicio real de la VM — los
+13 contenedores existentes y el runner volvieron solos. No quedó
+registrado un número de "uso real de CPU/memoria con Vault corriendo"
+porque Vault todavía no existe — eso se mide como parte de la
+implementación real de este documento (ver "Riesgos y preguntas
+abiertas"), no de esta HU, que ya cerró.
 
 ### HU-6 (stretch, fuera del alcance obligatorio): GitHub Actions sin secretos estáticos
 Como workflow de GitHub Actions, quiero autenticarme contra Vault vía
@@ -220,25 +251,29 @@ ese mismo paso, no generarse ahí mismo como hoy.
 
 ```mermaid
 flowchart TB
-    subgraph VM["VM OCI Ampere A1 (4 OCPU/24GB tras el resize)"]
+    subgraph VM["VM OCI Ampere A1 (4 OCPU/24GB, ya redimensionada)"]
         Vault["Vault OSS<br/>Raft single-node"]
         KMS["OCI KMS<br/>(auto-unseal)"]
-        Jenkins["Jenkins<br/>(orquestador CI/CD)"]
+        Jenkins["Jenkins<br/>(1 solo, org-wide)"]
+        Lib["Shared Library<br/>vars/corePipeline.groovy"]
         Nginx["nginx<br/>(Basic Auth de infra)"]
-        Apps["Stacks dev/qa/prod<br/>(auth-core-mc)"]
+        Apps["Stacks dev/qa/prod<br/>de CUALQUIER core<br/>(auth-core-mc, mail-core-mc, futuros)"]
 
         Vault -- "auto-unseal al arrancar" --> KMS
-        Jenkins -- "AppRole (RoleID + SecretID)" --> Vault
-        Jenkins -- "inyecta DB_PASSWORD/PAT/tokens<br/>en tiempo de deploy" --> Apps
-        Jenkins -- "renderiza .htpasswd<br/>en sync-vm-infra" --> Nginx
+        Jenkins -- "invoca" --> Lib
+        Lib -- "AppRole (RoleID + SecretID)" --> Vault
+        Lib -- "inyecta DB_PASSWORD/PAT/tokens<br/>en tiempo de deploy" --> Apps
+        Lib -- "renderiza .htpasswd<br/>vía certbotDomains" --> Nginx
     end
 
-    GHA["GitHub Actions<br/>(sync-vm-infra)"] -- "GitHub Actions Secrets<br/>(sin cambio en v1, ver HU-6)" --> Jenkins
+    GHA["GitHub Actions<br/>(sync-vm-infra, repo platform)"] -- "GitHub Actions Secrets<br/>(sin cambio en v1, ver HU-6)" --> Jenkins
     Marco["Marco<br/>(único operador)"] -- "unseal keys de respaldo<br/>(gestor de contraseñas)" -.-> Vault
 ```
-Muestra los tres consumidores automatizados (Jenkins, nginx vía
-Jenkins, y GitHub Actions sin cambio en v1) y el único humano en el
-diseño (Marco, solo como respaldo manual del unseal).
+Muestra que la integración vive en la Shared Library, no en el
+`Jenkinsfile` de cada core — cualquier core que ya la use (todos, desde
+el ticket 002) hereda Vault automáticamente. GitHub Actions sigue sin
+cambio en v1 (ver HU-6), y Marco solo entra como respaldo manual del
+unseal.
 
 ```mermaid
 sequenceDiagram
@@ -258,45 +293,69 @@ sin credenciales de larga duración quedando en el runner entre builds.
 
 ## Riesgos y preguntas abiertas
 
-- **¿El resize de OCI Ampere A1.Flex requiere reinicio o es en
-  caliente?** No confirmado en este documento — se verifica en la
-  consola real de OCI antes de ejecutar HU-5, y se planea ventana de
-  mantenimiento asumiendo que sí lo requiere (peor caso), hasta
-  confirmar lo contrario.
+- ~~¿El resize de OCI Ampere A1.Flex requiere reinicio o es en
+  caliente?~~ **Resuelto en la práctica, no de forma concluyente**:
+  Marco guardó el cambio de shape y reinició la VM en el mismo paso
+  (para también validar la resiliencia a reinicio del ticket 002), así
+  que no quedó aislado si el resize por sí solo hubiera necesitado
+  reinicio o no — irrelevante ya para este documento, el resize está
+  hecho de cualquier forma.
 - **¿Se fusiona este Vault con el de la Mac (Transit, ticket 017) más
-  adelante, o quedan separados para siempre?** Este documento asume
-  separados (propósitos distintos: uno es cifrado por sobres de datos
-  de aplicación, el otro es secrets manager de infra) — Marco debe
-  confirmar si eso es aceptable a largo plazo o si prefiere unificarlos
-  en una revisión futura.
+  adelante, o quedan separados para siempre?** Sigue sin resolver —
+  este documento sigue asumiendo separados (propósitos distintos: uno
+  es cifrado por sobres de datos de aplicación, el otro es secrets
+  manager de infra). Marco debe confirmarlo.
 - **Memoria/CPU real de Vault en reposo**, no medida todavía — se mide
-  igual que se hizo con Jenkins/SonarQube antes de comprometerse a
-  dejarlo corriendo 24/7, como parte de la implementación (no bloquea
-  el diseño, pero si el número sale mal, puede forzar reconsiderar el
-  resize de HU-5).
+  como parte de la implementación. Con la VM ya en 4 OCPU/24GB (el
+  doble que cuando se escribió la primera versión de este documento),
+  el riesgo de que este número fuerce reconsiderar el diseño es bajo,
+  pero se sigue midiendo con evidencia real, no se asume.
 - **Vault mismo como punto único de falla**: si Vault cae y el
   auto-unseal también falla, todo deploy queda bloqueado hasta
   resolverlo a mano. Mitigado parcialmente por HU-2 (respaldo manual),
-  pero es un tradeoff real y consciente de este diseño, no un problema
-  resuelto del todo — coherente con lo que Marco ya aceptó explícitamente
-  (mejorar esto más adelante).
-- **Orden real del resize vs. la instalación de Vault**: este documento
-  asume que el resize (HU-5) va ANTES de instalar Vault, para no sumar
-  el proceso nuevo sobre la máquina ya ajustada — confirmar que Marco
-  está de acuerdo con ese orden (implica que el resize, con su posible
-  downtime, se ejecuta primero, sin tener a Vault todavía como
-  motivación inmediata).
+  pero es un tradeoff real y consciente de este diseño — coherente con
+  lo que Marco ya aceptó explícitamente (mejorar esto más adelante).
+  Reforzado por el principio de automatización total que confirmó
+  después de este documento: vale la pena que la implementación real
+  incluya una alerta (Telegram, mismo canal que ya usa el pipeline) si
+  Vault queda sellado/inalcanzable, para no descubrirlo hasta que un
+  deploy falle.
+- **El PAT compartido de GitHub sigue siendo un secreto de alto
+  privilegio guardado fuera de Vault** (bootstrap de Jenkins, credential
+  store de la UI) — coherente con el diseño (alguien tiene que arrancar
+  la cadena de confianza, ver HU-3), pero el hallazgo del ticket 002
+  (ese mismo PAT puede saltarse branch protection) hace más urgente,
+  no menos, acotarlo — ver el ticket futuro ya anotado en "No incluye".
 
 ## Impacto estimado (tickets tentativos)
-- Ticket A: Resize de la VM a 4 OCPU/24GB (HU-5) — probablemente el
-  primero, desbloquea a los demás.
-- Ticket B: Instalación de Vault (Raft, auto-unseal OCI KMS) — sin
-  migrar nada todavía, solo la infra base + medición de recursos
-  (HU-1 parcial, HU-2).
-- Ticket C: AppRole de Jenkins + migración de secretos, ambiente por
-  ambiente (HU-1 completa, HU-3, HU-4).
-- Ticket D (stretch, no obligatorio): OIDC de GitHub Actions (HU-6) —
-  solo si se decide perseguir después de que C esté estable.
+El resize (HU-5, antes "Ticket A") ya está hecho — fuera de esta lista.
+Siguientes tickets, en `platform` (numeración real siguiente: 003+):
+
+- Ticket `platform/003`: Instalación de Vault (Raft, auto-unseal OCI
+  KMS) — sin migrar nada todavía, solo la infra base + medición de
+  recursos (HU-1 parcial, HU-2).
+- Ticket `platform/004`: AppRole integrado en `vars/corePipeline.groovy`
+  + migración de secretos, ambiente por ambiente, empezando por DEV de
+  `auth-core-mc` (HU-1 completa, HU-3, HU-4).
+- Ticket `platform/005` (stretch, no obligatorio): OIDC de GitHub
+  Actions (HU-6) — solo si se decide perseguir después de que 004 esté
+  estable.
 
 Se refinan a tickets reales (`nuevo-ticket`) después del VoBo de Marco
 sobre este documento.
+
+## Qué cambió desde la versión original (2026-08-31 → 2026-09-01)
+- El resize (antes prerrequisito pendiente) ya está hecho y verificado
+  con un reinicio real — deja de ser parte del alcance de este
+  documento.
+- El diseño ahora se integra explícitamente con la Shared Library de
+  Jenkins (`vars/corePipeline.groovy`, construida en el ticket 002) en
+  vez de ser una integración genérica sin mecanismo concreto — esto es
+  lo que hace que la migración beneficie a todo core automáticamente,
+  no solo a `auth-core-mc`.
+- Se suma el hallazgo real del PAT con permisos excesivos (ticket 002)
+  como motivación adicional, y como pregunta abierta nueva sobre si
+  Vault debería alojar un PAT nuevo y acotado a futuro.
+- Los paths de secretos y nombres de archivo se actualizaron contra lo
+  que hoy existe de verdad en `platform` (no lo que existía cuando se
+  escribió la primera versión, antes de la migración a este repo).
