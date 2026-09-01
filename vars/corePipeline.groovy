@@ -40,6 +40,16 @@
 //                                          ej. "deploy/vm-infra/nginx/auth-core-mc.conf".
 //                                          Si se omite, no se aplica ningún vhost (un core
 //                                          que todavía no tiene dominio propio).
+//   certbotDomains (List<String>, opcional) Dominios para los que correr `certbot --nginx`
+//                                          justo después de aplicar vhostFile -- ej.
+//                                          ['auth.64bitstudio.com', 'auth-qa.64bitstudio.com',
+//                                          'auth-dev.64bitstudio.com']. Necesario SIEMPRE que
+//                                          vhostFile tenga HTTPS real: el archivo que vive en
+//                                          git es la versión sin el bloque 443/ssl (certbot lo
+//                                          agrega en vivo, nunca se sincroniza a git) -- sin
+//                                          esto, cada deploy pisaría ese bloque con la versión
+//                                          solo-HTTP (ver "Incidente real" más abajo). Si se
+//                                          omite (un core sin DNS/cert todavía), no corre nada.
 //   buildAndTest   (Closure, opcional)    El paso real de compilar+testear+correr el
 //                                          análisis de SonarQube -- distinto por stack
 //                                          (gradle vs npm), así que la librería no lo
@@ -167,6 +177,22 @@ def call(Map config) {
             // y lo manda por stdin al contenedor host-exec, que lo
             // escribe en el /etc/nginx real del host y recarga el nginx
             // real (no uno de un contenedor).
+            //
+            // Incidente real (primer deploy real a DEV tras el fix del
+            // punto anterior, 2026-09-01): el archivo tal como vive en
+            // git es la versión SOLO-HTTP (sin bloque 443/ssl -- ver el
+            // comentario del propio auth-core-mc.conf); el bloque 443/ssl
+            // real lo agregó certbot DIRECTO en el archivo del host, a
+            // mano, hace semanas, y nunca se sincronizó a git. El cp de
+            // arriba lo pisó -- rompió HTTPS real de auth/auth-qa/
+            // auth-dev.64bitstudio.com durante unos minutos (el
+            // certificado en sí, en /etc/letsencrypt, nunca se tocó --
+            // restaurado corriendo certbot de nuevo). ci.yml YA tenía
+            // este mismo problema resuelto para jenkins.conf/
+            // vm-admin-tools.conf: vuelve a correr certbot --nginx justo
+            // después de cada cp, en cada push -- idempotente (si el
+            // certificado sigue vigente, certbot solo reconfigura nginx,
+            // no vuelve a pedirlo). Se replica el mismo patrón aquí.
             stage('Vhost de nginx (dev)') {
                 when {
                     allOf {
@@ -183,6 +209,17 @@ def call(Map config) {
                             systemctl reload nginx
                         '
                     """
+                    script {
+                        if (config.certbotDomains) {
+                            def domainArgs = config.certbotDomains.collect { "-d ${it}" }.join(' ')
+                            sh """
+                                docker run --rm --privileged --pid=host platform-host-exec sh -c '
+                                    command -v certbot >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y certbot python3-certbot-nginx)
+                                    certbot --nginx --non-interactive --agree-tos -m marco.cortes@64bitstudio.com ${domainArgs} --redirect
+                                ' || echo "::warning::certbot falló para ${project} -- excepción conocida, no un silencio (revisar a mano si se repite; el certificado ya emitido no se pierde por esto)."
+                            """
+                        }
+                    }
                 }
             }
 
