@@ -1152,14 +1152,26 @@ código se ve bien"): un deploy real a través del pipeline de Jenkins
 usando esta lógica requiere que este PR esté mergeado a `main` primero
 -- la Shared Library "platform" en JCasC usa `defaultVersion: "main"`
 (ver `casc/jenkins.yaml`), así que Jenkins no ve el código de este
-ticket hasta el merge. Verificado en cambio, todo lo que SÍ se puede
-probar sin el merge: las policies/AppRoles reales contra Vault
-(arriba), la sintaxis YAML completa de `ci.yml`
-(`python3 -c "import yaml..."` sin errores), y el mecanismo de alerta
-de HU-8 disparado de verdad en un run real de GitHub Actions (ver
-abajo). El siguiente push real a `dev` de `auth-core-mc` DESPUÉS del
-merge será la primera vez que se ejercite esta ruta real -- señalado
-explícitamente aquí, no asumido como ya probado.
+ticket hasta el merge. El siguiente push real a `dev` de `auth-core-mc`
+DESPUÉS del merge será la primera vez que se ejercite esta ruta real --
+señalado explícitamente aquí, no asumido como ya probado.
+
+**Sí verificado real, sin necesitar el merge** (dos runs completos de
+`sync-vm-infra` en `feature/004-approle-jenkins-migracion-secretos-infra`,
+el segundo en verde total tras corregir el hallazgo de `transit/*` en
+la policy `platform-admin`, ver arriba):
+- Los 6 pasos nuevos/modificados de este ticket, todos `success`:
+  Vault, alerta de sello (HU-8), motor Transit, sincronizar htpasswd
+  desde Vault (confirmado real: detectó que ya coincidía, sin recargar
+  nginx de más), sincronizar secretos de Jenkins desde Vault, y el
+  fallback de `SONAR_TOKEN` (confirmado que NO se ejecuta -- silencioso
+  porque el valor ya estaba puesto, no porque el paso esté roto).
+- Jenkins se reconstruyó de verdad con el `Dockerfile` nuevo (`jq`
+  agregado) -- confirmado `docker exec jenkins jq --version` en la VM
+  (`jq-1.7`), contenedor estable (`Up`, sin crash-loop), JCasC cargó
+  sin `ConfiguratorException` (revisado el log completo del contenedor,
+  ninguna ocurrencia) -- la credencial `vault-jenkins-secret-id` nueva
+  no rompió el arranque de Jenkins.
 
 ### HU-8: alerta de Telegram si Vault se sella -- bloqueada por un hallazgo real, no de este ticket
 
