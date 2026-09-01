@@ -391,32 +391,62 @@ def call(Map config) {
 // `pipefail` (controlan cosas distintas) -- los `echo` explícitos de
 // error siguen imprimiéndose igual, solo se apaga el eco automático de
 // cada línea de comando.
+// Ticket platform/005 (HU-7): generalizado para parchear no solo
+// DB_PASSWORD sino cualquier campo presente en secret/<project>/<env>
+// que el .env real ya declare (hoy: DB_PASSWORD siempre; VAULT_SECRET_ID
+// -- el bootstrap secret de la AppRole "auth-core-mc-backend" para
+// Transit -- desde que ese AppRole existe). Un solo login/fetch, un
+// solo paso por host-exec, en vez de repetir el round-trip completo por
+// campo. Un campo ausente en el JSON de Vault simplemente no se
+// patchea (no es un error -- permite que proyectos sin VAULT_SECRET_ID
+// todavía sigan funcionando con solo DB_PASSWORD).
+//
+// Cuidado con el nombre: el credential de Jenkins ("vault-jenkins-secret-id",
+// el SecretID de la AppRole "jenkins-infra") y el campo "VAULT_SECRET_ID"
+// dentro del JSON de Vault (el SecretID de la AppRole
+// "auth-core-mc-backend", un consumidor DISTINTO) son dos secretos
+// DIFERENTES que comparten un nombre parecido a propósito (mismo
+// significado semántico, distinto dueño) -- por eso la variable de
+// shell del credential de Jenkins se llama JENKINS_APPROLE_SECRET_ID
+// aquí, para no confundirlas ni una con otra en el script.
 def fetchAndPatchDbPasswordFromVault(project, envName) {
-    withCredentials([string(credentialsId: 'vault-jenkins-secret-id', variable: 'VAULT_SECRET_ID')]) {
+    withCredentials([string(credentialsId: 'vault-jenkins-secret-id', variable: 'JENKINS_APPROLE_SECRET_ID')]) {
         sh """
             set -euo pipefail
             set +x
-            PAYLOAD=\$(jq -n --arg r "${JENKINS_VAULT_APPROLE_ROLE_ID}" --arg s "\$VAULT_SECRET_ID" '{role_id:\$r, secret_id:\$s}')
+            PAYLOAD=\$(jq -n --arg r "${JENKINS_VAULT_APPROLE_ROLE_ID}" --arg s "\$JENKINS_APPROLE_SECRET_ID" '{role_id:\$r, secret_id:\$s}')
             VAULT_TOKEN=\$(curl -sf -X POST http://vault:8200/v1/auth/approle/login -d "\$PAYLOAD" | jq -r '.auth.client_token // empty')
             if [ -z "\$VAULT_TOKEN" ]; then
                 echo "No se pudo autenticar contra Vault (AppRole jenkins-infra) -- ¿está sellado/inalcanzable? No se toca el .env existente." >&2
                 exit 1
             fi
-            curl -sf -H "X-Vault-Token: \$VAULT_TOKEN" http://vault:8200/v1/secret/data/${project}/${envName} \\
-                | jq -r '.data.data.DB_PASSWORD // empty' \\
+            SECRET_JSON=\$(curl -sf -H "X-Vault-Token: \$VAULT_TOKEN" http://vault:8200/v1/secret/data/${project}/${envName})
+            # Validar DB_PASSWORD ANTES de tocar el archivo -- garantiza el
+            # rollback real de HU-4: si falta, no se escribe NADA (ni
+            # siquiera los demás campos), el .env existente queda intacto.
+            HAS_DB_PASSWORD=\$(echo "\$SECRET_JSON" | jq -r '.data.data.DB_PASSWORD // empty')
+            if [ -z "\$HAS_DB_PASSWORD" ]; then
+                echo "DB_PASSWORD vacío/no encontrado en Vault para ${project}/${envName} -- abortando sin tocar el archivo." >&2
+                exit 1
+            fi
+            echo "\$SECRET_JSON" \\
+                | jq -r '.data.data | to_entries | map(select(.key == "DB_PASSWORD" or .key == "VAULT_SECRET_ID")) | map("\\(.key)=\\(.value)") | .[]' \\
                 | docker run --rm -i --privileged --pid=host platform-host-exec sh -c '
-                    NEWVAL=\$(cat)
                     FILE=/home/ubuntu/secrets/${project}/.env.${envName}
-                    if [ -z "\$NEWVAL" ]; then
-                        echo "DB_PASSWORD vacío/no encontrado en Vault para ${project}/${envName} -- abortando sin tocar el archivo." >&2
-                        exit 1
-                    fi
                     if [ ! -f "\$FILE" ]; then
                         echo "\$FILE no existe -- no se puede parchear un archivo que no existe (ver rollback HU-4)." >&2
                         exit 1
                     fi
-                    sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=\$NEWVAL|" "\$FILE"
-                '
+                    while IFS= read -r LINE; do
+                        KEY=\$(echo "\$LINE" | cut -d= -f1)
+                        VAL=\$(echo "\$LINE" | cut -d= -f2-)
+                        [ -z "\$VAL" ] && continue
+                        if grep -q "^\${KEY}=" "\$FILE"; then
+                            sed -i "s|^\${KEY}=.*|\${KEY}=\${VAL}|" "\$FILE"
+                        else
+                            printf "%s=%s\\n" "\$KEY" "\$VAL" >> "\$FILE"
+                        fi
+                    done'
         """
     }
 }
