@@ -103,3 +103,41 @@ Telegram. Verificado con evidencia real, no solo "el job pasó":
   .../commits/86f5a90/check-runs` → `total_count: 0`) — el workflow no
   se disparó, a diferencia del push anterior con cambios reales.
 
+### Hallazgo real (2026-09-01): recrear Jenkins mató un build en curso de otro repo
+
+Mientras este primer push corría `sync-vm-infra` (02:11:26–02:12:02),
+había un build de Jenkins EN CURSO para el PR #82 de `auth-core-mc`
+(gradle `build sonar`, iniciado 02:09:52). El paso "Jenkins (orquestador
+del pipeline...)" recreó el contenedor `jenkins` a las 02:11:53 — no por
+un cambio real de `Dockerfile`/`plugins.txt` (el hash-check ya cubre
+eso), sino porque el bind mount `deploy/vm-infra/jenkins/casc/` se
+resuelve a la ruta ABSOLUTA del checkout en el runner
+(`/home/ubuntu/actions-runner-64bitstudio/_work/<repo>/<repo>/...`), y
+esa ruta cambió al venir de `platform` en vez de `auth-core-mc` —
+Docker Compose vio un "config distinto" y recreó el contenedor pese a
+que el contenido del archivo es idéntico. El build de gradle en curso
+(proceso dentro del contenedor viejo) murió con el contenedor; Jenkins
+volvió a subir a los 30s, pero el *durable task* que corría el shell
+del pipeline ya no existía — el build #1 de ese PR falló 10 minutos
+después con `FAILURE` (timeout del heartbeat), sin ningún error real de
+compilación/tests (confirmado: 0 ocurrencias de `FAILED`/
+`AssertionError`/`Compilation failed` en su log). Se resolvió
+reintentando ese build (push de un commit vacío en `auth-core-mc`, build
+#2) — no fue necesario tocar nada de este repo.
+
+**Esto era una migración de una sola vez para esta ruta específica**
+(la ruta del checkout de `platform` ya queda fija de aquí en adelante,
+así que un push futuro normal a `platform` no debería volver a recrear
+Jenkins por este mismo motivo) — pero el riesgo de fondo es real y
+general, no exclusivo de esta migración: **cualquier cosa que recree el
+contenedor de Jenkins (cambio de `Dockerfile`/`plugins.txt`, de GID, de
+`casc/`, etc.) puede matar un build de cualquier core que esté corriendo
+en ese instante**, porque `sync-vm-infra` y el pipeline de cada core
+(`Jenkinsfile`) corren sin ninguna coordinación entre sí. Propuesto como
+mejora futura (no implementado en este ticket, fuera de su alcance):
+que el paso que recrea Jenkins en `sync-vm-infra` primero verifique si
+hay un build activo (`docker exec jenkins ...` contra la API de Jenkins,
+o un lock simple en la VM) y lo espere/reintente en vez de recrear a
+ciegas — candidato a hook/chequeo nuevo, mismo criterio que
+`docker-preflight.sh` para el gotcha de OrbStack.
+
