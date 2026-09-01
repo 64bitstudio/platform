@@ -1214,10 +1214,37 @@ existieran). Esto significa, con alta probabilidad:
   este repo (ticket 001), así que su condición (`if ! grep -q
   '^SONAR_TOKEN=.\+'`) nunca se cumplió.
 
-**No se corrigió en este ticket** -- es una discrepancia real y
-material (afecta directamente si HU-8 puede considerarse "hecha" de
-verdad: sin estos secrets, la alerta nunca llegaría en un incidente
-real), señalada a Marco con esta evidencia en vez de decidir sola la
-resolución (¿reusar el bot/chat de `~/dev-infra/.env` de la Mac?
-¿generar credenciales nuevas dedicadas a la VM?) -- pendiente de su
-respuesta antes de dar HU-8 por cerrada de verdad.
+### HU-8 -- resuelto de verdad (2026-09-01)
+
+Marco decidió: reusar el mismo bot/chat de Telegram que ya usa para
+notificaciones locales en su Mac -- no duplicar credenciales dedicadas
+a la VM. Aplicado y verificado con evidencia real, no solo "se ve
+verde":
+
+1. `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` configurados como GitHub
+   Actions Secrets reales del repo `platform` -- confirmado con la
+   misma API que detectó que estaban vacíos (`gh api
+   repos/64bitstudio/platform/actions/secrets` -> `"total_count": 2`
+   ahora, antes 0).
+2. **Los 3 `curl` a la API de Telegram** (HU-8, `Notify success`,
+   `Notify failure`) ahora revisan el código HTTP real Y el campo `ok`
+   del cuerpo de respuesta -- cualquiera que falle hace fallar el step
+   de verdad (`exit 1` + `::error::`), en vez de que un `curl` sin `-f`
+   se vea verde pase lo que pase.
+3. **Confirmado en un run real** (`feature/004-...`, run
+   `33540897606`): `Notify success (Telegram)` -> `success` -- esta vez
+   con la verificación real de HTTP 200 + `ok:true` pasando de verdad,
+   no solo el exit code de `curl`. Primera entrega confirmada de una
+   notificación de `sync-vm-infra` desde que este job existe.
+
+**`SONAR_TOKEN`/`SONAR_HOST_URL` -- sigue sin resolver, a propósito**:
+el `SONAR_HOST_URL` del `~/dev-infra/.env` de la Mac de Marco apunta a
+`http://localhost:9000` -- el SonarQube LOCAL de su Mac, una instancia
+completamente distinta a la de la VM (separadas a propósito desde el
+ticket 049, "instancia NUEVA sin migrar historial/proyectos"). Reusar
+ese token fallaría contra el SonarQube real de la VM (usuarios/tokens
+no compartidos entre instancias). No se asumió ni se copió un valor
+incorrecto -- señalado a Marco como pregunta aparte, pendiente de su
+respuesta. Sin impacto práctico inmediato: el `SONAR_TOKEN` de Jenkins
+ya migró a Vault con un valor real (ver arriba), este paso de
+auto-generación solo importaría en un rebuild desde cero de la VM.
