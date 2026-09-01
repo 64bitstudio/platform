@@ -1,0 +1,56 @@
+# Ticket platform/003 -- Vault Community Edition ("Vault OSS" en el
+# documento de definición: HashiCorp renombró la edición gratuita
+# self-hosted de "OSS" a "Community Edition" en 2023, mismo producto,
+# mismo alcance -- KV, Transit, AppRole, todo lo que este documento usa;
+# ver docs/definiciones/vault-secrets-manager-vm.md). Infra COMPARTIDA de
+# la VM, mismo patrón que Traefik/SonarQube/Jenkins/Portainer -- storage
+# backend Raft integrado (single-node), auto-unseal vía OCI KMS (ver
+# ./config/vault.hcl para el porqué completo de cada opción).
+#
+# Sin labels de Traefik/red "edge" a propósito -- Vault NO se expone a
+# internet en esta primera versión (ninguna HU del documento de
+# definición lo pide); solo alcanzable desde dentro de la VM (127.0.0.1,
+# uso administrativo) y desde otros contenedores de la red interna
+# "vm-infra" (Jenkins hoy, el backend de auth-core-mc desde el ticket
+# 005). Revisar esta decisión si en el futuro hiciera falta acceso a la
+# UI de Vault desde fuera de la VM (agregaría el mismo patrón de Basic
+# Auth de nginx que ya usan sonarqube/traefik/portainer).
+name: vm-infra-vault
+
+services:
+  vault:
+    image: hashicorp/vault:2.0.4
+    container_name: vault
+    restart: unless-stopped
+    # Sin cap_add: IPC_LOCK a propósito -- la imagen oficial 2.0+ ya no la
+    # soporta (ver comentario "Vault 2.0+" en vault.hcl); disable_mlock =
+    # true en la config es el reemplazo recomendado por HashiCorp para
+    # contenedores, y sin swap habilitado en esta VM (Swap: 0B, `free -h`
+    # verificado) el riesgo real que mlock() mitigaría no aplica aquí.
+    environment:
+      VAULT_ADDR: "http://127.0.0.1:8200"
+    volumes:
+      - ./config/vault.hcl:/vault/config/vault.hcl:ro
+      - vault_file:/vault/file
+      - vault_logs:/vault/logs
+    # Sin "-config=..." explícito: el entrypoint oficial ya arma
+    # "vault server -config=/vault/config" por default cuando el primer
+    # argumento es "server" -- agregar un -config redundante aquí duplica
+    # el flag sin necesidad (Vault simplemente usa el último).
+    command: ["server"]
+    ports:
+      # Solo loopback -- mismo patrón que SonarQube/Jenkins en
+      # 127.0.0.1: acceso administrativo de Marco vía SSH a la VM (CLI de
+      # vault o un túnel), nunca expuesto directo a internet.
+      - "127.0.0.1:8200:8200"
+    networks:
+      - default
+      - vm-infra
+
+networks:
+  vm-infra:
+    external: true
+
+volumes:
+  vault_file:
+  vault_logs:

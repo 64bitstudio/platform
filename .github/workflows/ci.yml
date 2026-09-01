@@ -156,6 +156,19 @@ jobs:
       - name: Portainer (dashboard de Docker/Compose, compartido de la VM)
         run: docker compose -f deploy/vm-infra/portainer/docker-compose.yml up -d
 
+      # Ticket 003 (docs/definiciones/vault-secrets-manager-vm.md): Vault
+      # Community Edition, fuente única de secretos de infra + motor
+      # Transit -- compartido de la VM, mismo patrón idempotente que
+      # SonarQube/Portainer arriba (imagen oficial, sin build propio, "up
+      # -d" no hace nada si no cambió nada real). Requiere que el Dynamic
+      # Group + Policy de OCI IAM ya existan (ver docs/ARQUITECTURA.md,
+      # "Vault -- OCI KMS auto-unseal") -- si no existen todavía, el
+      # contenedor arranca pero queda en crash-loop esperando poder
+      # autenticarse contra OCI KMS (falla explícito en sus logs, nunca
+      # en silencio) hasta que Marco los cree.
+      - name: Vault (secrets manager compartido de la VM)
+        run: docker compose -f deploy/vm-infra/vault/docker-compose.yml up -d
+
       # Bootstrap idempotente de /home/ubuntu/secrets/jenkins/.env (nunca
       # lo pisa si ya existe con un password real puesto por Marco).
       - name: Asegurar /home/ubuntu/secrets/jenkins/.env (si falta)

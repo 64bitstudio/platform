@@ -738,3 +738,114 @@ este a "el push se hubiera rechazado" en vez de "el push se aceptó con
 un aviso". No se investiga ni se implementa en este ticket -- ya se
 extendió más allá de su alcance original.
 
+## Ticket 003 (2026-09-01, EN PROGRESO): instalar Vault (Raft, auto-unseal OCI KMS, Transit)
+
+Deriva de `docs/definiciones/vault-secrets-manager-vm.md` (VoBo Marco
+2026-09-01). **Este ticket sigue en `pending/`, no en `done/` — bloqueado
+en un paso real que requiere una acción de Marco (ver "Bloqueo real"
+abajo)**; esta sección documenta lo ya construido y verificado hasta ese
+punto, se completa cuando el ticket cierre.
+
+### Vault -- OCI KMS auto-unseal
+
+Recursos de OCI creados en la tenancy de Marco (región `mx-queretaro-1`,
+compartimento raíz -- esta tenancy no usa sub-compartimentos):
+
+| Recurso | OCID | Nota |
+|---|---|---|
+| Vault (OCI KMS, tipo DEFAULT) | `ocid1.vault.oc1.mx-queretaro-1.ibvjm2v7aaana.abyxeljr2ax7a5igphjczquyvigf4g2yx72w6hp6owg4zvxzgzhx4lewvkia` | Software-protected — **sin costo** (confirmado: solo las llaves HSM-protected cobran por versión; las software-protected no tienen cargo, ver [Oracle KMS FAQ](https://www.oracle.com/security/cloud-security/key-management/faq/)). No es un tercer proveedor nuevo (mismo OCI que ya aloja la VM), pero SÍ es un servicio de OCI distinto de Compute — se aclara explícitamente porque el roadmap del equipo enmarca la infra como "100% Always Free" y KMS no es técnicamente parte de Always Free, aunque en este caso concreto termina costando $0 por usar solo llaves software. |
+| Llave AES-256 de auto-unseal | `ocid1.key.oc1.mx-queretaro-1.ibvjm2v7aaana.abyxeljr6u3fcjpcn6aj5wr3o2mtyf2yggk63r6yfrgrdk5wke26gzn6f4ha` | `platform-vm-vault-autounseal`, protection mode SOFTWARE. |
+| Crypto endpoint | `https://ibvjm2v7aaana-crypto.kms.mx-queretaro-1.oci.oraclecloud.com` | Usado por el seal `ocikms` en `vault.hcl`. |
+| Management endpoint | `https://ibvjm2v7aaana-management.kms.mx-queretaro-1.oci.oraclecloud.com` | Ídem. |
+
+**Autenticación: instance principal (`auth_type_api_key = false`)**, no
+llaves de API estáticas guardadas en la VM -- la identidad de la VM
+misma (vía su IMDS, `169.254.169.254`) es la credencial. Verificado en
+vivo que un contenedor Docker con networking por default (sin
+`--network=host`) SÍ alcanza el IMDS de OCI desde esta VM (`docker run
+curlimages/curl ... http://169.254.169.254/opc/v2/instance/id` devolvió
+el OCID real de la instancia).
+
+**Bloqueo real -- pendiente de Marco**: crear el Dynamic Group y la
+Policy de IAM que autorizan a la VM a *usar* (nunca administrar) esa
+llave específica está bloqueado para este agente por el clasificador de
+permisos (cambio de seguridad a nivel de la cuenta/tenancy de OCI, fuera
+de lo que un agente debe decidir solo). Comando exacto, un solo bloque,
+para correr desde la Mac (ya tiene `oci` CLI configurado y probado en
+esta sesión):
+
+```bash
+oci iam dynamic-group create --compartment-id ocid1.tenancy.oc1..aaaaaaaamhyw2ekupvxrpal3ohic74niksj3tobwosl2g3j4eljxxatykgeq --name platform-vm-vault-dg --description "VM ampere-free -- Vault OSS auto-unseal via instance principal (ticket platform/003)" --matching-rule "instance.id = 'ocid1.instance.oc1.mx-queretaro-1.anyxeljr4cdrmjycn32ejrpfwuuah3ga2y33puvqcsz2t223hqvlqp5n6sbq'" && oci iam policy create --compartment-id ocid1.tenancy.oc1..aaaaaaaamhyw2ekupvxrpal3ohic74niksj3tobwosl2g3j4eljxxatykgeq --name platform-vm-vault-autounseal-policy --description "Least privilege: solo usar (no administrar) la llave de auto-unseal de Vault (ticket platform/003)" --statements "[\"Allow dynamic-group platform-vm-vault-dg to use keys in tenancy where target.key.id = 'ocid1.key.oc1.mx-queretaro-1.ibvjm2v7aaana.abyxeljr6u3fcjpcn6aj5wr3o2mtyf2yggk63r6yfrgrdk5wke26gzn6f4ha'\"]"
+```
+
+Verificado en vivo (no en teoría) que el bloqueo real es exactamente
+este y nada más: con la configuración completa ya en su lugar, el
+contenedor de Vault sí llega a OCI KMS (no es un problema de red/IMDS) y
+falla con el error explícito `NotAuthorizedOrNotFound` al intentar usar
+la llave -- exactamente lo que falta hasta que exista el Dynamic
+Group/Policy de arriba.
+
+### Hallazgo real: `/vault/data` vs `/vault/file` en la imagen oficial
+
+El `docker-entrypoint.sh` de la imagen oficial `hashicorp/vault` solo
+hace `chown vault:vault` de `/vault/config`, `/vault/logs` y
+`/vault/file` cuando detecta que están bind-mounted (comparando el UID
+dueño contra el del usuario `vault` del contenedor) -- **nunca de
+`/vault/data`**, la ruta que usan la mayoría de los tutoriales de Raft
+storage. Un volumen nombrado en `/vault/data` queda con dueño `root`, y
+Vault (que corre como usuario no-root dentro del contenedor) falla en
+el primer arranque con `permission denied: open /vault/data/vault.db`.
+Solución real (sin workarounds de `chmod`/init-container/correr como
+root): usar `/vault/file` como `path` del storage `raft` -- es la ruta
+que el propio entrypoint ya sabe preparar. Verificado en vivo: con este
+cambio el contenedor deja de fallar por permisos y llega hasta el paso
+de auto-unseal (ver bloqueo de arriba).
+
+### Vault 2.0 (Community Edition) -- versión, no OSS "clásico"
+
+`hashicorp/vault:2.0.4` (última estable en Docker Hub al momento de
+este ticket) -- "Vault OSS" del documento de definición es la misma
+edición gratuita self-hosted, renombrada "Community Edition" por
+HashiCorp desde 2023 (BUSL 1.1, no afecta el uso self-hosted sin
+revender Vault como servicio, que es exactamente este caso). El salto
+de versión 1.21 -> 2.0 es administrativo (alineación de HashiCorp con
+el ciclo de soporte de IBM tras la adquisición), no un cambio de
+producto. Cambio real que sí importa aquí: la imagen 2.0+ ya **no**
+soporta la capability `IPC_LOCK` dentro de contenedores (removida a
+propósito por HashiCorp) -- se usa `disable_mlock = true` en `vault.hcl`
+en vez de `cap_add: IPC_LOCK`, siguiendo la recomendación oficial. Sin
+impacto real de seguridad en esta VM: `free -h` confirma `Swap: 0B`
+(sin swap habilitado), así que no hay a dónde un secreto pudiera
+"filtrarse" por la ausencia de `mlock()`.
+
+### Sin exponer Vault a internet (decisión de esta primera versión)
+
+`deploy/vm-infra/vault/docker-compose.yml` no lleva labels de Traefik ni
+se conecta a la red `edge` -- Vault solo es alcanzable desde `127.0.0.1`
+de la propia VM (uso administrativo de Marco por SSH) y desde otros
+contenedores de la red interna `vm-infra` (Jenkins hoy; el backend de
+`auth-core-mc` desde el ticket 005). Ninguna HU del documento de
+definición pide UI pública de Vault. Mismo modelo de confianza que
+Jenkins↔SonarQube (HTTP plano sobre `vm-infra`, sin TLS) -- no es una
+categoría de riesgo nueva para esta VM.
+
+### Pendiente para cerrar este ticket (bloqueado en la acción de arriba)
+
+- `vault operator init` (genera el token root inicial + las recovery
+  keys de respaldo -- con auto-unseal vía KMS, Vault usa recovery keys
+  Shamir en vez de unseal keys Shamir tradicionales; cumplen el mismo
+  rol de respaldo manual que pide HU-2) y entrega a Marco para su
+  gestor de contraseñas.
+- Habilitar el motor Transit + crear la llave `auth-core-mc-tenant-keys`,
+  probado con `vault write transit/encrypt/...` real.
+- Reinicio real de la VM (bloqueado para este agente, exclusivo de
+  Marco) para verificar HU-2 de punta a punta -- comando exacto se
+  entrega junto con el resto del cierre de este ticket.
+- Prueba real de desellado manual con las recovery keys (simulando que
+  OCI KMS no está disponible).
+- `docker stats` de Vault en reposo, con número real (no estimado).
+- Extender `sync-vm-infra` -- **ya hecho** en este mismo commit
+  (`.github/workflows/ci.yml`), pendiente de verificar en verde una vez
+  que el paso de arriba deje de fallar (ahora mismo fallaría en CI igual
+  que en la prueba manual, por el mismo `NotAuthorizedOrNotFound`).
+
