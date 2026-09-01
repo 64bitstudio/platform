@@ -66,6 +66,17 @@ path "secret/*" {
   capabilities = ["create", "read", "update", "delete", "list"]
 }
 
+# Hallazgo real (ticket 004, primer run real de sync-vm-infra): faltaba
+# esto. El motor Transit (habilitado en el ticket 003) también es
+# trabajo administrativo continuo -- el paso idempotente de
+# sync-vm-infra que asegura la llave auth-core-mc-tenant-keys, y el
+# futuro AppRole del backend de auth-core-mc (ticket 005), lo
+# necesitan. Sin esto, hasta LEER si la llave ya existe daba 403 (no
+# solo crearla) -- verificado en vivo, no teórico.
+path "transit/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
 path "auth/approle/*" {
   capabilities = ["create", "read", "update", "delete", "list"]
 }

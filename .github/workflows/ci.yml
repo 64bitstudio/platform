@@ -184,7 +184,6 @@ jobs:
         run: |
           HEALTH=$(docker exec vault vault status -format=json 2>/dev/null || echo "")
           SEALED=$(echo "$HEALTH" | python3 -c "import json,sys; print(json.load(sys.stdin).get('sealed', True))" 2>/dev/null || echo "unreachable")
-          SEALED="True" # TEMP-TEST-HU8 -- forzado solo para esta corrida de verificación, se revierte en el siguiente commit
           if [ "$SEALED" = "False" ]; then
             echo "Vault desellado y respondiendo -- OK."
           else
