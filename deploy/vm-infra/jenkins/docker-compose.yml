@@ -55,7 +55,9 @@ services:
       JAVA_OPTS: "-Xmx1536m -Djenkins.install.runSetupWizard=false"
       JENKINS_ADMIN_USER: ${JENKINS_ADMIN_USER:?falta JENKINS_ADMIN_USER en /home/ubuntu/secrets/jenkins/.env}
       JENKINS_ADMIN_PASSWORD: ${JENKINS_ADMIN_PASSWORD:?falta JENKINS_ADMIN_PASSWORD en /home/ubuntu/secrets/jenkins/.env}
-      GITHUB_PAT: ${GITHUB_PAT:-}
+      # GITHUB_PAT (ticket 049) retirado de aquí en el ticket 006 -- el
+      # credential "github-pat" ya no existe en casc/jenkins.yaml (ver ese
+      # archivo), así que ya nada dentro del contenedor lo consume.
       SONAR_HOST_URL: ${SONAR_HOST_URL:-http://sonarqube:9000}
       SONAR_TOKEN: ${SONAR_TOKEN:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}

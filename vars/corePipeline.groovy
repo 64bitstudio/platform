@@ -329,9 +329,26 @@ def call(Map config) {
                         // SUCCESS, reportado durante el build de QA que promovió
                         // este mismo commit -- la protección de la rama exige que
                         // el SHA tenga ese check en verde, no que lo reciba en
-                        // este momento. Verificado en vivo (ver docs/ARQUITECTURA.md
-                        // ticket 006) que un push de un commit SIN ese check
-                        // previo, con este mismo credential, sí se rechaza.
+                        // este momento.
+                        //
+                        // Verificado en vivo de verdad (no solo afirmado): rama de
+                        // prueba con la MISMA protección real de `dev` copiada campo
+                        // a campo, installation token real de esta misma GitHub App
+                        // (flujo JWT completo, ver docs/ARQUITECTURA.md ticket 006),
+                        // push directo (sin PR, sin check previo en verde) -- GitHub
+                        // lo RECHAZÓ:
+                        //   remote: error: GH006: Protected branch update failed...
+                        //   remote: - Changes must be made through a pull request.
+                        //   remote: - Required status check "continuous-integration/
+                        //     jenkins/branch" is expected.
+                        //   ! [remote rejected] ... (protected branch hook declined)
+                        // A diferencia del PAT viejo (mismo escenario, mismo tipo de
+                        // prueba, ver docs/definiciones/vault-secrets-manager-vm.md),
+                        // que SÍ dejaba pasar el push con "Bypassed rule violations".
+                        // La GitHub App no hereda el privilegio de admin/owner de
+                        // ningún humano -- por eso el push normal de ESTE stage (SHA
+                        // ya con el check en verde) sigue funcionando exactamente
+                        // igual, sin necesitar ningún bypass.
                         withCredentials([usernamePassword(credentialsId: 'github-app', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PAT')]) {
                             sh """
                                 git push https://\${GIT_USER}:\${GIT_PAT}@github.com/64bitstudio/${project}.git HEAD:refs/heads/prod

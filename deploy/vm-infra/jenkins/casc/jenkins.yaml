@@ -11,9 +11,11 @@
 # romper el arranque completo de Jenkins por un error de sintaxis en el
 # DSL no valía la pena por algo que Marco hace una sola vez.
 #
-# JENKINS_ADMIN_USER/JENKINS_ADMIN_PASSWORD/GITHUB_PAT vienen del
-# entorno del contenedor (ver docker-compose.yml, que los toma de
-# /home/ubuntu/secrets/jenkins/.env — NUNCA hardcodeados aquí).
+# JENKINS_ADMIN_USER/JENKINS_ADMIN_PASSWORD/GITHUB_APP_ID/
+# GITHUB_APP_PRIVATE_KEY_B64 vienen del entorno del contenedor (ver
+# docker-compose.yml, que los toma de /home/ubuntu/secrets/jenkins/.env
+# — NUNCA hardcodeados aquí). GITHUB_PAT (ticket 049) ya NO se consume
+# en este archivo desde el ticket 006 -- ver "credentials:" más abajo.
 # JENKINS_ADMIN_USER/PASSWORD ya no se consumen en ESTE archivo (la
 # seguridad se gestiona por UI, ver más abajo) pero siguen
 # necesitándose en docker-compose.yml/el .env para el resto del flujo
@@ -66,15 +68,17 @@ credentials:
   system:
     domainCredentials:
       - credentials:
-          - usernamePassword:
-              scope: GLOBAL
-              id: "github-pat"
-              username: "marco-cortes"
-              password: "${GITHUB_PAT:-}"
-              description: >
-                PAT de GitHub para checkout/webhook/push de Jenkins
-                (auth-core-mc + mail-core-mc). Generado por Marco,
-                nunca en git -- ver docs/ARQUITECTURA.md ticket 049.
+          # Ticket 006: "github-pat" (PAT compartido de la cuenta personal
+          # de Marco, usado desde el ticket 049 para checkout/webhook/push
+          # de Jenkins) RETIRADO de aquí -- reemplazado por completo por el
+          # credential "github-app" más abajo, verificado de punta a punta
+          # (ver su descripción y docs/ARQUITECTURA.md ticket 006: la
+          # GitHub App SÍ rechaza el bypass de branch protection que el PAT
+          # dejaba pasar, deploy real a dev sin regresión). El valor real
+          # del PAT sigue existiendo en secret/jenkins de Vault (histórico,
+          # sin limpiar) y como GITHUB_PAT en docker-compose.yml -- el PAT
+          # en sí (el token de GitHub) debe revocarse aparte, en la cuenta
+          # de Marco (acción suya, fuera del alcance de este repo/agente).
           - string:
               scope: GLOBAL
               id: "sonar-token"
@@ -112,25 +116,30 @@ credentials:
               description: >
                 Ticket 006 (docs/definiciones/vault-secrets-manager-vm.md,
                 HU-9): GitHub App "64bitstudio-jenkins-ci" -- reemplaza al
-                PAT compartido de la cuenta personal de Marco. Hallazgo
-                real que motivó el cambio (probado en vivo, no asumido):
-                un PAT fine-grained SIN "Administration" seguía dejando
-                pasar un push directo a una rama protegida con el mismo
-                aviso de "Bypassed rule violations" del incidente del
-                ticket 002 -- el bypass está atado a que la cuenta de
-                Marco es owner de la organización, no a los permisos que
-                el token declare. Una GitHub App tiene su propia
-                identidad (no la de ningún usuario humano), así que
-                nunca hereda ese bypass. GitHubAppCredentials implementa
+                PAT compartido de la cuenta personal de Marco (retirado de
+                este archivo). Hallazgo real que motivó el cambio (probado
+                en vivo, no asumido): un PAT fine-grained SIN
+                "Administration" seguía dejando pasar un push directo a
+                una rama protegida con el mismo aviso de "Bypassed rule
+                violations" del incidente del ticket 002 -- el bypass está
+                atado a que la cuenta de Marco es owner de la
+                organización, no a los permisos que el token declare. Una
+                GitHub App tiene su propia identidad (no la de ningún
+                usuario humano), así que nunca hereda ese bypass.
+                GitHubAppCredentials implementa
                 StandardUsernamePasswordCredentials -- funciona como
                 reemplazo directo de "github-pat" en cualquier
                 withCredentials/checkout existente, sin cambiar la forma
                 en que se usa, solo el id. Los tokens de instalación que
                 genera son de corta vida (~1h) y se renuevan solos --
-                nunca un secreto de larga duración guardado.
-                "github-pat" (el PAT viejo) se deja declarado pero sin
-                usar hasta confirmar el reemplazo de punta a punta;
-                limpieza futura, no de este ticket.
+                nunca un secreto de larga duración guardado (confirmado
+                en vivo: installation token real obtenido vía el flujo JWT
+                completo, expiración real ~1h, ver docs/ARQUITECTURA.md
+                ticket 006). Verificado de punta a punta: la prueba de
+                bypass (rama con la misma protección real de dev) fue
+                RECHAZADA por GitHub, a diferencia del PAT viejo -- y el
+                deploy real a dev de auth-core-mc siguió funcionando sin
+                regresión con este credential.
 
 unclassified:
   location:
