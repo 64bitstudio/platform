@@ -20,6 +20,16 @@ runner activo en la Mac de Marco) que este proyecto debe resolver
 explícitamente, no ignorar. Ninguna implementación arranca hasta VoBo
 conjunto explícito sobre este documento.
 
+> **VoBo condicional de Marco (2026-09-02)**, sobre 3 de las 12
+> preguntas abiertas (ver detalle en cada una, sección "Riesgos y
+> preguntas abiertas"): (1) exige una estrategia de backup real de
+> Forgejo antes de apagar GitHub — riesgo 1; (2) completar la migración
+> interna de `mail-core-mc` a Jenkins es PRERREQUISITO explícito, no
+> alcance opcional — pregunta 11; (3) autoriza un piloto/prueba antes de
+> comprometer cualquier repo real — pregunta 12, condicionado a que el
+> prerrequisito (2) esté resuelto primero. Las 9 preguntas restantes
+> siguen sin respuesta — no se asume ninguna.
+
 ## Objetivo de negocio
 
 Consistencia con la filosofía de infraestructura ya aplicada al resto de
@@ -596,6 +606,11 @@ flowchart LR
    resolverse (estrategia de backup real de Forgejo) **antes** de apagar
    GitHub, no después.
 
+   > **Decisión de Marco (2026-09-02)**: definir un backup real de
+   > Forgejo antes de apagar GitHub — no se acepta el riesgo sin
+   > mitigar. Queda como prerrequisito explícito de la fase de
+   > implementación, no una nota aparte.
+
 2. **HALLAZGO REAL, no contemplado en el alcance original**:
    `mail-core-mc` no está completamente migrado a Jenkins como el resto.
    Sus ramas `qa` y `prod` siguen teniendo `.github/workflows/ci.yml`
@@ -676,11 +691,19 @@ flowchart LR
 11. Sobre el hallazgo de `mail-core-mc` (riesgo 2): ¿completar su
     migración interna a Jenkins en `qa`/`prod` es un prerrequisito de
     este proyecto, o se incluye como parte de su alcance?
+
+    > **Respondida (2026-09-02)**: es prerrequisito. No arranca ningún
+    > trabajo de Forgejo hasta que `mail-core-mc` esté completamente en
+    > Jenkins en `qa`/`prod` (ver `mail-core-mc/pending/011-pipeline-
+    > cicd-deploy-vm.md`, en curso al momento de esta respuesta).
 12. ¿Autoriza correr una migración de **prueba/piloto** (un repo, o una
     copia de uno) antes de comprometerse en firme, dado que varios puntos
     (numeración de PRs, comportamiento real de Forgejo Actions, footprint
     real en la VM) requieren verificación empírica y no solo
     documentación?
+
+    > **Respondida (2026-09-02)**: sí, autorizado. El piloto se ejecuta
+    > una vez resuelto el prerrequisito de la pregunta 11 — no antes.
 
 ## Impacto estimado
 
