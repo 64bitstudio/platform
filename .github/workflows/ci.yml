@@ -574,6 +574,13 @@ jobs:
       # con GITHUB_APP_PRIVATE_KEY_B64 nuevo cuando cambia -- disparado a
       # propósito para la verificación real de la llave nueva de la
       # GitHub App (ver docs/ARQUITECTURA.md).
+      #
+      # Ticket 006 (2do disparo real): convertir la llave en Vault de
+      # PKCS#1 a PKCS#8 (gotcha real del plugin github-branch-source, ver
+      # docs/ARQUITECTURA.md) NO alcanza por sí solo -- Jenkins sigue
+      # corriendo con el valor viejo hasta que ESTE paso corre de nuevo y
+      # recrea el contenedor. Un push a auth-core-mc no dispara esto (vive
+      # en platform) -- se necesita un push real aquí.
       - name: Jenkins (orquestador del pipeline, compartido de la VM)
         run: |
           # Hallazgo real (ticket 006, reproducido con una llave RSA falsa

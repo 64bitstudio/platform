@@ -1437,3 +1437,399 @@ ambientes, no asumido por similitud con DEV") **cumplido en DEV, QA y
 PROD**, cada uno con su propia base de datos, su propio tenant de
 prueba, y su propia verificación real -- no una asumida por parecido
 con otra.
+
+## Ticket 006 (2026-09-01/02, CERRADO): GitHub App reemplaza al PAT compartido — con un incidente real de seguridad en el camino
+
+Deriva de `docs/definiciones/vault-secrets-manager-vm.md` (VoBo Marco
+2026-09-01) -- implementa HU-9. Objetivo: reemplazar el PAT compartido
+de la cuenta personal de Marco (hallazgo real del ticket 002: puede
+saltarse branch protection) por un mecanismo que NO herede ese
+privilegio. Se investigó primero un PAT fine-grained acotado (sin
+`Administration`) -- **también dejaba pasar el bypass**, verificado en
+vivo (ver la adenda de 2026-09-01 en
+`docs/definiciones/vault-secrets-manager-vm.md`): el bypass está atado
+a que la cuenta de Marco es *owner* de la organización, no a los
+permisos que el token declare. Se pivotó a una **GitHub App**
+(`64bitstudio-jenkins-ci`, App ID `4797871`, instalada en `auth-core-mc`
+con permisos `contents:write, metadata:read, pull_requests:read,
+repository_hooks:write, statuses:write` -- **sin `Administration`**,
+confirmado independientemente vía `gh api orgs/64bitstudio/installations`
+antes de dar nada por bueno): tiene su propia identidad, no la de
+ningún humano, así que no puede heredar ese bypass.
+
+### Incidente real de seguridad: la llave privada quedó expuesta dos veces en un repo público
+
+**Transparencia total, sin minimizar**: durante la implementación (antes
+de que este agente retomara el ticket), la llave privada de la GitHub
+App quedó impresa en texto plano en el log de un run de GitHub Actions
+de `64bitstudio/platform` -- **repo público** -- en **dos runs
+distintos**, confirmado por Marco con
+`gh run view <id> --log | grep -c "BEGIN.*PRIVATE KEY"` → 1 en ambos.
+Ambos runs se borraron de inmediato (`gh api .../actions/runs/<id> -X
+DELETE`) para cortar la exposición pública. La llave quedó considerada
+comprometida sin excepción -- **nunca se reutilizó ni se buscó
+recuperarla**; Marco generó una llave nueva desde cero.
+
+**Primer leak (causa ya conocida antes de este agente)**: pasar la
+llave PEM real (multilínea) directo como valor de una variable de
+entorno de Docker Compose rompe la estructura YAML del propio compose
+file -- Compose interpola `${VAR}` como texto plano ANTES de parsear su
+YAML. El run falló con `exit code 127`, fragmentos de la llave
+aparecieron como si Compose intentara ejecutarlos como comandos. Fix ya
+aplicado antes de este agente: la llave viaja codificada en base64 (una
+sola línea, segura para esa interpolación) y se decodifica DENTRO del
+contenedor, antes de que Jenkins arranque
+(`deploy/vm-infra/jenkins/docker-entrypoint-wrapper.sh`).
+
+**Segundo leak (con el fix de base64 YA aplicado) -- causa raíz nunca
+identificada por el agente anterior, sesión perdida sin transcripción**.
+Diagnosticado por este agente usando **solo datos falsos** antes de
+tocar la llave real, tal como pidió el orquestador:
+
+1. Se generó una llave RSA falsa (`openssl genrsa`, sin relación con la
+   real) y se reprodujo el flujo completo localmente (build de la
+   imagen real, `docker run`/`docker compose up -d --build` con la
+   llave falsa, arranque de Jenkins con JCasC real) -- **cero
+   apariciones** del patrón en el log del contenedor; el credential
+   `github-app` se creó correctamente vía la API de credenciales de ese
+   Jenkins de prueba. El mecanismo de base64 + decode en el
+   entrypoint, por sí solo, está limpio.
+2. Se investigó (y se descartó, con evidencia) una hipótesis real: una
+   entrada cruda `GITHUB_APP_PRIVATE_KEY=<PEM multilínea>` (sin `_B64`)
+   que hubiera quedado huérfana en `/home/ubuntu/secrets/jenkins/.env`
+   de una versión vieja del script haría que el paso "Jenkins" de
+   `ci.yml` (que hace `set -a; . .env; set +a`) abortara con
+   **exit 127** imprimiendo un fragmento real de la llave como
+   `command not found` (el shell de GitHub Actions corre con `-e`) --
+   reproducido byte a byte con la llave falsa. Se verificó en la VM
+   real (solo nombres de campo, nunca valores) que ese artefacto **no
+   está presente actualmente** -- no se puede confirmar que esta fuera
+   la causa del incidente ya ocurrido (el log real se borró), pero es
+   una vulnerabilidad real y latente, corregida de todas formas de
+   forma defensiva (ver abajo).
+3. **Hallazgo estructural, independiente de la línea exacta que
+   filtró**: ningún secreto leído de Vault en runtime (incluida la
+   llave, `SONAR_TOKEN`, los tokens de login de Vault) pasaba por el
+   mecanismo de enmascarado de logs de GitHub Actions -- ese mecanismo
+   solo cubre valores registrados vía `secrets.*` del propio workflow;
+   nada de lo que `ci.yml` lee de Vault en tiempo de ejecución
+   calificaba. Es decir: **cualquier futuro `echo $VAR` de debug
+   habría vuelto a imprimir la llave en claro, sin ninguna barrera**,
+   sin importar cuál fuera la causa raíz puntual del segundo leak.
+
+**Fixes aplicados** (commit `e078c8a`, verificados con evidencia real,
+no solo revisando código):
+- `::add-mask::` inmediatamente después de leer cada secreto de Vault
+  en `ci.yml` (7 puntos: 4 tokens de login de AppRole, el hash de
+  htpasswd, cada valor del loop `GITHUB_PAT/SONAR_TOKEN/TELEGRAM_*/
+  GITHUB_APP_ID`, la llave b64 de la GitHub App, y el `SONAR_TOKEN`
+  releído para el webhook de SonarQube) -- mitigación de defensa en
+  profundidad, activa sin importar la causa raíz puntual de cualquier
+  leak futuro.
+- Limpieza defensiva en el paso "Jenkins": si alguna vez reaparece una
+  entrada cruda `GITHUB_APP_PRIVATE_KEY=` (sin `_B64`) en el `.env`
+  real, se detecta y se elimina (rango completo hasta su propio
+  `-----END PRIVATE KEY-----`) **antes** de hacer `source` del archivo,
+  con un `::warning::` en vez de abortar imprimiendo fragmentos.
+
+**Verificación real, con la llave FALSA, de que el fix funciona** (run
+`33576748615`, `sync-vm-infra`, `success`, con la llave falsa ya
+sembrada en `secret/jenkins` vía la AppRole `platform-admin`): **cero
+apariciones reales** del patrón `BEGIN.*PRIVATE KEY` en las 622 líneas
+del log completo (el único match es texto de los propios comentarios
+del código, echoado como fuente del step, no un valor real);
+`add-mask` se activó 9 veces; el paso "Sincronizar secretos de Jenkins
+desde Vault" terminó limpio; Jenkins se recreó (`Container jenkins
+Recreated`), confirmando que la llave falsa sí se propagó de punta a
+punta sin filtrarse en ningún punto.
+
+### Hallazgo real adicional (no parte del incidente de la llave, encontrado verificando de punta a punta): TELEGRAM_BOT_TOKEN/CHAT_ID en blanco en Vault
+
+Antes de sembrar la llave real, Marco confirmó (solo lectura) que
+`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` en `secret/jenkins` tenían
+**longitud 0** -- vacíos de verdad, a pesar de que el cierre del
+ticket 004 reportó haberlos migrado.
+
+**Causa raíz real, encontrada por código, no solo teorizada**:
+`deploy/vm-infra/vault/migrate-infra-secrets.sh` hacía un
+`vault kv put secret/jenkins` -- un **reemplazo completo** del path,
+no un merge -- con solo 4 campos codeados a mano (`GITHUB_PAT`,
+`SONAR_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`), leyendo sus
+valores del `.env` **local** de la VM en ese momento. Ese `.env` local
+nunca tiene esos 2 valores llenos automáticamente -- `ci.yml` los
+consume directo de los GitHub Actions Secrets del repo para sus
+propias notificaciones (`Verificar sello de Vault`/`Notify success`/
+`Notify failure`), nunca los escribe de vuelta al `.env`. Si ese
+script se re-corrió en algún punto posterior (p. ej. durante el propio
+ticket 006, para "refrescar" secretos tras agregar `GITHUB_APP_ID`),
+con `TELEGRAM_BOT_TOKEN`/`CHAT_ID` en blanco en el `.env` local, ese
+`put` completo sobreescribió `secret/jenkins` **entero** con esos 2
+campos en blanco -- el propio comentario del script ("seguro de
+re-correr") era la causa raíz del riesgo: dejó de ser cierto en cuanto
+`secret/jenkins` creció más allá de los 4 campos que el script conocía.
+
+**Fix real** (mismo commit `e078c8a`):
+- `migrate-infra-secrets.sh` usa `vault kv patch` (merge real) en vez
+  de `kv put` para `secret/jenkins`.
+- Paso nuevo, idempotente, en `ci.yml`
+  ("Auto-reparar TELEGRAM_BOT_TOKEN/CHAT_ID de Jenkins en Vault si
+  están vacíos"): si detecta esos 2 campos vacíos en Vault Y ya existen
+  como GitHub Actions Secrets del repo (confirmados reales, son los
+  mismos que ya usan las notificaciones de este mismo archivo), los
+  restaura con un merge real -- lee `secret/jenkins` completo, solo
+  reemplaza esos 2 campos, escribe de vuelta -- **sin pedir
+  credenciales nuevas a Marco, sin tocar ningún otro campo**
+  (`GITHUB_PAT`/`SONAR_TOKEN`/`GITHUB_APP_ID`/`GITHUB_APP_PRIVATE_KEY`
+  quedan intactos, verificado).
+
+**Verificado con el mismo rigor de HU-8 (no solo "se ve verde")**: en
+el run real `33576748615`, el paso restauró los valores
+(`"secret/jenkins tenía TELEGRAM_BOT_TOKEN y/o TELEGRAM_CHAT_ID vacíos
+-- restaurando..."` → `"OK: ... restaurados"`), y el paso "Notify
+success (Telegram)" del **mismo run**, que usa esos mismos valores
+literales, imprimió `"Notificación de éxito entregada de verdad (HTTP
+200)"` -- entrega real confirmada, no asumida. En el run siguiente
+(`33578558366`, ya con la llave real sembrada), el mismo paso confirmó
+`"TELEGRAM_BOT_TOKEN/CHAT_ID ya tienen valor real en Vault -- sin
+cambios"` -- contenido real persistido, no solo el campo presente.
+
+### Llave real sembrada y verificada con el mismo rigor
+
+Marco generó la llave nueva (la comprometida nunca se reutilizó) y la
+subió a la VM (`/home/ubuntu/secrets/vault/github-app-private-key-new.pem`,
+600). Sembrada en `secret/jenkins` (campo `GITHUB_APP_PRIVATE_KEY`) vía
+la AppRole `platform-admin` (`vault kv patch`, pre-autorizada desde el
+ticket 004 para este tipo de trabajo administrativo) -- verificado por
+hash SHA-256 byte a byte antes y después del `patch`, nunca comparando
+el valor en claro. Hallazgo operativo real en el camino: `docker cp`
+preserva el dueño del archivo ORIGEN (el usuario `ubuntu` del host), no
+coincide con el usuario `vault` (uid 100, no root) del contenedor --
+`vault kv patch ... @archivo` fallaba leyendo el archivo (permission
+denied) ANTES de evaluar la policy; no era un problema de capability
+como se sospechó al principio. Fix: `docker exec -u root vault chown
+vault:vault <archivo>` justo después del `docker cp`.
+
+**Verificación real con la llave real** (run `33578558366`,
+`sync-vm-infra`, `success`): mismo resultado que con la llave falsa --
+**cero apariciones reales** del patrón en las 621 líneas del log
+completo, `add-mask` activo 9 veces, Jenkins recreado limpio.
+
+### Hallazgo real adicional: la llave de una GitHub App viene en PKCS#1, Jenkins exige PKCS#8
+
+Al intentar la verificación de regresión (checkout real de auth-core-mc
+con el credential nuevo), el primer build falló:
+```
+java.security.spec.InvalidKeySpecException: Private key must be a PKCS#8 formatted string,
+to convert it from PKCS#1 use: openssl pkcs8 -topk8 -inform PEM -outform PEM -in current-key.pem -out new-key.pem -nocrypt
+Caused: java.lang.IllegalArgumentException: Couldn't parse private key for GitHub app, make sure it's PKCS#8 format
+	at org.jenkinsci.plugins.github_branch_source.GitHubAppCredentials.createJwtProvider
+```
+No es una regresión de seguridad ni del retiro del PAT -- es un gotcha
+conocido del plugin `github-branch-source`: la llave que GitHub genera
+para una App viene en formato PKCS#1
+(`-----BEGIN RSA PRIVATE KEY-----`), y el plugin exige PKCS#8
+(`-----BEGIN PRIVATE KEY-----`). Fix determinístico: convertida en la
+VM (nunca impresa, todo vía la AppRole `platform-admin`) con
+`openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt`, verificada
+por header (`RSA PRIVATE KEY` → `PRIVATE KEY`) Y por el modulus RSA
+(confirmado idéntico -- mismo par de llaves, solo cambió el encoding,
+no la llave en sí) antes de escribirla de vuelta en Vault con
+`vault kv patch`.
+
+**Segundo hallazgo real, de proceso**: convertir la llave en Vault no
+alcanza por sí sola -- Jenkins seguía corriendo con el valor viejo en
+su entorno hasta que algo dispara `sync-vm-infra` (el job que lee
+Vault, escribe `/home/ubuntu/secrets/jenkins/.env` y recrea el
+contenedor). Un push a `auth-core-mc` no toca ese pipeline (vive en
+`platform`) -- hizo falta un push real a `platform` para que Jenkins
+recogiera la llave PKCS#8 nueva.
+
+### Prueba de bypass real, con la GitHub App (criterio de aceptación del ticket)
+
+Mismo procedimiento exacto que la prueba original del PAT (documentada
+en la adenda de `docs/definiciones/vault-secrets-manager-vm.md`): una
+rama de prueba en `auth-core-mc` (`ticket-006-bypass-protected`) con la
+protección real de `dev` copiada campo a campo por API
+(`enforce_admins:false`, `required_status_checks` con el contexto
+`continuous-integration/jenkins/branch`, `allow_force_pushes:false`,
+etc. -- confirmado idéntico), y un push directo (sin PR, sin check
+previo en verde) usando el credential de la GitHub App.
+
+A diferencia del PAT (que usaba un token generado directo desde la
+cuenta de Marco), una GitHub App exige minar un **installation token**
+real vía un JWT firmado (RS256) con la llave privada -- se hizo el
+flujo completo en la VM (login a Vault con `platform-admin`, fetch de
+la llave real, JWT armado y firmado con `openssl dgst -sign`,
+intercambiado contra `POST /app/installations/158345502/access_tokens`
+de la API de GitHub) sin pasar por Jenkins -- mismo patrón de "push
+directo con el token" que la prueba original del PAT, ni la llave ni
+el installation token se imprimieron en ningún momento.
+
+**Resultado real**:
+```
+Installation token real obtenido -- expira: 2026-09-02T02:30:44Z (no se imprime el valor)
+remote: error: GH006: Protected branch update failed for refs/heads/ticket-006-bypass-protected.
+remote: - Changes must be made through a pull request.
+remote: - Required status check "continuous-integration/jenkins/branch" is expected.
+! [remote rejected] HEAD -> ticket-006-bypass-protected (protected branch hook declined)
+EXIT_CODE_DEL_PUSH=1
+RESULTADO=RECHAZADO (esperado -- la GitHub App NO logro saltarse branch protection)
+```
+
+**GitHub RECHAZÓ el push** -- a diferencia del PAT (que lo dejaba pasar
+con `Bypassed rule violations`). Confirma el objetivo real del ticket:
+la GitHub App no hereda el privilegio de admin/owner de ningún humano.
+Nota de proceso real: el primer intento de reproducir esto disparando
+un build de Jenkins en una rama nueva arbitraria falló dos veces con
+`"This commit cannot be built"` (el Multibranch de Jenkins no la
+construye -- causa exacta no confirmada, probablemente una estrategia
+de "Discover branches" limitada por nombre; no bloqueó la verificación
+real porque el mecanismo de JWT directo, más fiel a como se probó el
+PAT originalmente, no depende de Jenkins).
+
+Limpieza tras la prueba: PR de prueba (`auth-core-mc#89`) cerrado sin
+mergear, protección de la rama de prueba removida, ambas ramas
+(`ticket-006-bypass-protected`, `ticket-006-bypass-trigger`) borradas.
+
+### Renovación automática de tokens de instalación
+
+`GitHubAppCredentials` nunca guarda un secreto de larga duración -- cada
+vez que Jenkins necesita el password del credential `github-app`, el
+plugin mina (o reusa, si sigue vigente) un installation token de vida
+corta. La propia prueba de bypass de arriba ejercitó ese mecanismo de
+punta a punta (el mismo flujo JWT → installation token que usa el
+plugin internamente) y devolvió, real, de la propia API de GitHub, una
+expiración de **~1 hora desde la emisión** (`expires_at:
+2026-09-02T02:30:44Z` contra una emisión a las `2026-09-02T01:30:44Z`
+aprox.) -- confirmado con el dato real de la API, no asumido por la
+documentación del plugin.
+
+### Hallazgo real adicional: dos rincones que JCasC NO gestiona seguían con `github-pat` hardcodeado
+
+Al verificar el checkout real de `auth-core-mc` con el credential
+nuevo aparecieron, en cadena, **dos** problemas reales distintos --
+ninguno relacionado con seguridad/permisos, ambos de "algo se quedó
+con el credential viejo hardcodeado fuera de JCasC":
+
+1. **La llave viene en PKCS#1, Jenkins exige PKCS#8** (ver más abajo,
+   corregido primero) -- una vez corregido, el checkout seguía
+   fallando.
+2. **El folder "GitHub Organization" (`64bitstudio`) no se gestiona
+   vía JCasC** -- decisión ya documentada del ticket 049 (JCasC
+   deliberadamente solo cubre plugins/credenciales/mensaje del
+   sistema, nunca el job Multibranch/Organization Folder en sí, creado
+   una sola vez a mano por Marco desde la UI). Su propio
+   `config.xml` en disco (`/var/jenkins_home/jobs/64bitstudio/config.xml`
+   dentro del contenedor `jenkins`) seguía teniendo
+   `<credentialsId>github-pat</credentialsId>` en su
+   `GitHubSCMNavigator` -- ese es el componente real que:
+   - publica el commit status de cada build (de ahí el error real
+     encontrado: `Could not update commit status. Message:
+     {"message":"Requires authentication",...,"status":"401"}`,
+     visible también como `"Warning: CredentialId 'github-pat' could
+     not be found"` justo antes del checkout -- el checkout mismo
+     seguía funcionando porque el repo permite clonar en modo
+     anónimo de solo lectura, así que el fallo real quedaba oculto
+     hasta el final del build);
+   - y de donde cada job de rama hereda el credential para el
+     checkout del repo (con `github-pat` inexistente, caía a acceso
+     anónimo, sin publicar status).
+
+   **Diagnosticado leyendo el `config.xml` real por SSH** (Marco), NO
+   asumido por el mensaje de error solo. **Fix**: cambiar ese
+   `credentialsId` a `github-app` desde la propia UI de Jenkins
+   (`64bitstudio` → `Configure` → fuente "GitHub Organization" →
+   dropdown de Credentials → `github-app` → `Save`) -- la forma
+   correcta de tocar este rincón específico (no gestionado por JCasC a
+   propósito), no una edición de XML a mano. Un intento anterior de
+   aplicar esto directo por SSH (editando el `config.xml` con `sed`)
+   fue bloqueado por el clasificador de auto-mode tanto en la sesión
+   de Marco como en la de este agente -- confirma que es exactamente
+   el tipo de cambio de config/credencial de Jenkins que ese
+   mecanismo está diseñado para frenar; se resolvió por el canal
+   correcto (UI), no forzando el bloqueo.
+
+   **Verificado con evidencia real, con cuidado de timestamps** (dos
+   builds anteriores parecían "seguir fallando" pero en realidad
+   habían corrido ANTES de que el fix quedara guardado de verdad --
+   confirmado comparando el `created_at` real del build contra la hora
+   real del `Save`): build `#5` de la rama de verificación, iniciado
+   **después** del fix (`created_at: 2026-09-02T15:56:36Z`, fix
+   guardado a las `15:54:30Z`) --
+   ```
+   Connecting to https://api.github.com using 4797871/****** (GitHub App...)
+   ```
+   en vez de acceso anónimo, build `Finished: SUCCESS`, **sin**
+   `"Could not update commit status"` en el log completo, y
+   `gh pr checks 90` mostrando el check real:
+   ```
+   continuous-integration/jenkins/branch  pass  0  ...  This commit looks good
+   ```
+
+   **Verificación de "algún otro rincón similar"** (pedida
+   explícitamente, no asumido que este era el único): `docker exec
+   jenkins grep -rl "github-pat" /var/jenkins_home/jobs/` sobre TODOS
+   los `config.xml` de Jenkins -- ver el resultado real en
+   `done/006-pat-github-acotado.md`, sección "Hecho".
+
+### Verificación de regresión: deploy real a dev de auth-core-mc
+
+Ver `auth-core-mc#90` (comentario en el Jenkinsfile documentando el
+cambio de credential). Bloqueada dos veces en el camino (PKCS#1/PKCS#8
+primero, el Organization Folder después) -- ambas ajenas al mecanismo
+de seguridad del ticket en sí (ninguna es una regresión de permisos ni
+del retiro del PAT). Resultado real final: ver la sección "Hecho" del
+ticket en `done/006-pat-github-acotado.md`.
+
+### PAT viejo retirado
+
+Una vez confirmado el reemplazo de punta a punta (commit `50bd879`):
+credential `github-pat` eliminado por completo de
+`deploy/vm-infra/jenkins/casc/jenkins.yaml` (ya no declarado, ya no
+consumido); variable `GITHUB_PAT` retirada del `environment:` de
+`docker-compose.yml`. Jenkins se recreó limpio tras el cambio
+(`Container jenkins Recreated`, run `33579906150`, sin crash-loop,
+`success`). **Corrección real importante**: "retirado de JCasC" NO
+significaba "retirado de todo Jenkins" -- el Organization Folder (ver
+el hallazgo de arriba) seguía referenciándolo desde un `config.xml`
+que JCasC nunca toca. Ambos rincones confirmados limpios ahora (ver
+"Hecho" del ticket para el grep real sobre todos los jobs). El valor
+real del PAT sigue vivo en `secret/jenkins` de Vault (histórico, sin
+limpiar) -- **revocar el token en sí, en la cuenta de GitHub de Marco,
+es una acción suya**, fuera del alcance de este repo/agente (señalado
+explícitamente, no asumido como hecho).
+
+### Mejora continua propuesta (no implementada en este ticket)
+
+- **Runbook nuevo candidato: "rotar un credential de Jenkins"**, del
+  hallazgo del Organization Folder de arriba -- cualquier proyecto
+  nuevo que use un Organization Folder / Multibranch Pipeline de
+  Jenkins debe recordar explícitamente que ese job se crea a mano por
+  UI (decisión del ticket 049, JCasC nunca lo gestiona), así que
+  cualquier credential que referencie queda **fuera** del control de
+  versiones y de cualquier rotación automática vía JCasC -- si el
+  credential que usa se retira o se reemplaza (como pasó aquí), hay
+  que acordarse de actualizar ESE job también, a mano, por UI. Un
+  runbook explícito con este paso evita que el próximo cambio de
+  credential se tope con la misma sorpresa sin saber por qué.
+- **Hook/check de CI nuevo candidato**: validar en un job dedicado (o
+  como parte de un template reusable de `~/dev-infra/ci-templates/`)
+  que todo workflow que lea un secreto en runtime desde una fuente
+  externa a `secrets.*` (Vault, un archivo, una API) emita
+  `::add-mask::` inmediatamente después -- este ticket lo aplicó a
+  mano en `ci.yml`, pero un lint/check automático lo haría
+  estructural para cualquier proyecto nuevo, no dependiente de que
+  cada agente se acuerde.
+- **Segundo hook/check candidato**: cuando un script administrativo de
+  Vault (`migrate-infra-secrets.sh` y similares) escribe a un path que
+  otros mecanismos también escriben (`secret/jenkins`), usar
+  `kv patch` en vez de `kv put` por default -- un lint simple podría
+  marcar cualquier `vault kv put` sobre un path ya usado por más de un
+  consumidor.
+- Habilitar `secret_scanning_push_protection` a nivel de repo/org en
+  GitHub (confirmado deshabilitado en `64bitstudio/platform` durante
+  este ticket, `security_and_analysis.secret_scanning_push_protection.status:
+  "disabled"`) -- hubiera bloqueado el push que causó el primer leak
+  antes de que llegara a un log público. Requiere decisión de Marco
+  (puede generar fricción en pushes legítimos con falsos positivos) --
+  señalado, no activado unilateralmente aquí.

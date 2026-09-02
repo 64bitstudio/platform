@@ -564,7 +564,27 @@ realmente cierre el hueco, confirmado). GitHub App gana en "máxima
 automatización": los tokens de instalación son de vida corta (~1h) y
 se renuevan solos, sin rotación manual nunca.
 
-**Pendiente de verificar con el mecanismo real** (mismo procedimiento
-de arriba, esta vez con la GitHub App en vez del PAT de prueba) -- ver
-`docs/ARQUITECTURA.md`, ticket 006, para el resultado real una vez
-confirmado, no asumido aquí por adelantado.
+**Verificado con el mecanismo real (2026-09-02)** -- mismo
+procedimiento de arriba, esta vez con la GitHub App en vez del PAT de
+prueba (installation token real, minado vía JWT firmado con la llave
+real, sin pasar por Jenkins): el push directo a una rama de prueba con
+la misma protección real de `dev` fue **RECHAZADO** por GitHub
+(`GH006: Protected branch update failed`, `protected branch hook
+declined`) -- a diferencia del PAT, que sí lo dejaba pasar. Ver
+`docs/ARQUITECTURA.md`, ticket 006, para el log completo y toda la
+evidencia (incluido el incidente real de la llave privada expuesta dos
+veces en logs públicos durante la implementación, su causa raíz, y los
+fixes aplicados).
+
+**Nota real de implementación (no un riesgo de seguridad, un gotcha
+operativo)**: hacer funcionar el credential nuevo de punta a punta
+requirió, además de JCasC, dos ajustes fuera de JCasC -- convertir la
+llave a PKCS#8 (formato que exige el plugin `github-branch-source`,
+GitHub entrega las llaves de Apps en PKCS#1) y corregir el
+`credentialsId` del folder "GitHub Organization" de Jenkins (ese job
+se crea a mano por UI desde el ticket 049, JCasC nunca lo gestiona --
+seguía apuntando al `github-pat` ya retirado, causando que no se
+pudiera publicar el commit status de cada build). Ver
+`docs/ARQUITECTURA.md`, ticket 006, para el detalle completo -- queda
+como advertencia para cualquier futura rotación de credenciales de
+Jenkins: revisar también los jobs que JCasC no gestiona.
