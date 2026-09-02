@@ -575,3 +575,16 @@ declined`) -- a diferencia del PAT, que sí lo dejaba pasar. Ver
 evidencia (incluido el incidente real de la llave privada expuesta dos
 veces en logs públicos durante la implementación, su causa raíz, y los
 fixes aplicados).
+
+**Nota real de implementación (no un riesgo de seguridad, un gotcha
+operativo)**: hacer funcionar el credential nuevo de punta a punta
+requirió, además de JCasC, dos ajustes fuera de JCasC -- convertir la
+llave a PKCS#8 (formato que exige el plugin `github-branch-source`,
+GitHub entrega las llaves de Apps en PKCS#1) y corregir el
+`credentialsId` del folder "GitHub Organization" de Jenkins (ese job
+se crea a mano por UI desde el ticket 049, JCasC nunca lo gestiona --
+seguía apuntando al `github-pat` ya retirado, causando que no se
+pudiera publicar el commit status de cada build). Ver
+`docs/ARQUITECTURA.md`, ticket 006, para el detalle completo -- queda
+como advertencia para cualquier futura rotación de credenciales de
+Jenkins: revisar también los jobs que JCasC no gestiona.

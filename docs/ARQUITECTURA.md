@@ -1704,12 +1704,82 @@ expiración de **~1 hora desde la emisión** (`expires_at:
 aprox.) -- confirmado con el dato real de la API, no asumido por la
 documentación del plugin.
 
+### Hallazgo real adicional: dos rincones que JCasC NO gestiona seguían con `github-pat` hardcodeado
+
+Al verificar el checkout real de `auth-core-mc` con el credential
+nuevo aparecieron, en cadena, **dos** problemas reales distintos --
+ninguno relacionado con seguridad/permisos, ambos de "algo se quedó
+con el credential viejo hardcodeado fuera de JCasC":
+
+1. **La llave viene en PKCS#1, Jenkins exige PKCS#8** (ver más abajo,
+   corregido primero) -- una vez corregido, el checkout seguía
+   fallando.
+2. **El folder "GitHub Organization" (`64bitstudio`) no se gestiona
+   vía JCasC** -- decisión ya documentada del ticket 049 (JCasC
+   deliberadamente solo cubre plugins/credenciales/mensaje del
+   sistema, nunca el job Multibranch/Organization Folder en sí, creado
+   una sola vez a mano por Marco desde la UI). Su propio
+   `config.xml` en disco (`/var/jenkins_home/jobs/64bitstudio/config.xml`
+   dentro del contenedor `jenkins`) seguía teniendo
+   `<credentialsId>github-pat</credentialsId>` en su
+   `GitHubSCMNavigator` -- ese es el componente real que:
+   - publica el commit status de cada build (de ahí el error real
+     encontrado: `Could not update commit status. Message:
+     {"message":"Requires authentication",...,"status":"401"}`,
+     visible también como `"Warning: CredentialId 'github-pat' could
+     not be found"` justo antes del checkout -- el checkout mismo
+     seguía funcionando porque el repo permite clonar en modo
+     anónimo de solo lectura, así que el fallo real quedaba oculto
+     hasta el final del build);
+   - y de donde cada job de rama hereda el credential para el
+     checkout del repo (con `github-pat` inexistente, caía a acceso
+     anónimo, sin publicar status).
+
+   **Diagnosticado leyendo el `config.xml` real por SSH** (Marco), NO
+   asumido por el mensaje de error solo. **Fix**: cambiar ese
+   `credentialsId` a `github-app` desde la propia UI de Jenkins
+   (`64bitstudio` → `Configure` → fuente "GitHub Organization" →
+   dropdown de Credentials → `github-app` → `Save`) -- la forma
+   correcta de tocar este rincón específico (no gestionado por JCasC a
+   propósito), no una edición de XML a mano. Un intento anterior de
+   aplicar esto directo por SSH (editando el `config.xml` con `sed`)
+   fue bloqueado por el clasificador de auto-mode tanto en la sesión
+   de Marco como en la de este agente -- confirma que es exactamente
+   el tipo de cambio de config/credencial de Jenkins que ese
+   mecanismo está diseñado para frenar; se resolvió por el canal
+   correcto (UI), no forzando el bloqueo.
+
+   **Verificado con evidencia real, con cuidado de timestamps** (dos
+   builds anteriores parecían "seguir fallando" pero en realidad
+   habían corrido ANTES de que el fix quedara guardado de verdad --
+   confirmado comparando el `created_at` real del build contra la hora
+   real del `Save`): build `#5` de la rama de verificación, iniciado
+   **después** del fix (`created_at: 2026-09-02T15:56:36Z`, fix
+   guardado a las `15:54:30Z`) --
+   ```
+   Connecting to https://api.github.com using 4797871/****** (GitHub App...)
+   ```
+   en vez de acceso anónimo, build `Finished: SUCCESS`, **sin**
+   `"Could not update commit status"` en el log completo, y
+   `gh pr checks 90` mostrando el check real:
+   ```
+   continuous-integration/jenkins/branch  pass  0  ...  This commit looks good
+   ```
+
+   **Verificación de "algún otro rincón similar"** (pedida
+   explícitamente, no asumido que este era el único): `docker exec
+   jenkins grep -rl "github-pat" /var/jenkins_home/jobs/` sobre TODOS
+   los `config.xml` de Jenkins -- ver el resultado real en
+   `done/006-pat-github-acotado.md`, sección "Hecho".
+
 ### Verificación de regresión: deploy real a dev de auth-core-mc
 
 Ver `auth-core-mc#90` (comentario en el Jenkinsfile documentando el
-cambio de credential). Bloqueada inicialmente por el hallazgo de
-PKCS#1/PKCS#8 de arriba -- resultado real final una vez resuelto: ver
-la sección "Hecho" del ticket en `done/006-pat-github-acotado.md`.
+cambio de credential). Bloqueada dos veces en el camino (PKCS#1/PKCS#8
+primero, el Organization Folder después) -- ambas ajenas al mecanismo
+de seguridad del ticket en sí (ninguna es una regresión de permisos ni
+del retiro del PAT). Resultado real final: ver la sección "Hecho" del
+ticket en `done/006-pat-github-acotado.md`.
 
 ### PAT viejo retirado
 
@@ -1719,13 +1789,29 @@ credential `github-pat` eliminado por completo de
 consumido); variable `GITHUB_PAT` retirada del `environment:` de
 `docker-compose.yml`. Jenkins se recreó limpio tras el cambio
 (`Container jenkins Recreated`, run `33579906150`, sin crash-loop,
-`success`). El valor real del PAT sigue vivo en `secret/jenkins` de
-Vault (histórico, sin limpiar) -- **revocar el token en sí, en la
-cuenta de GitHub de Marco, es una acción suya**, fuera del alcance de
-este repo/agente (señalado explícitamente, no asumido como hecho).
+`success`). **Corrección real importante**: "retirado de JCasC" NO
+significaba "retirado de todo Jenkins" -- el Organization Folder (ver
+el hallazgo de arriba) seguía referenciándolo desde un `config.xml`
+que JCasC nunca toca. Ambos rincones confirmados limpios ahora (ver
+"Hecho" del ticket para el grep real sobre todos los jobs). El valor
+real del PAT sigue vivo en `secret/jenkins` de Vault (histórico, sin
+limpiar) -- **revocar el token en sí, en la cuenta de GitHub de Marco,
+es una acción suya**, fuera del alcance de este repo/agente (señalado
+explícitamente, no asumido como hecho).
 
 ### Mejora continua propuesta (no implementada en este ticket)
 
+- **Runbook nuevo candidato: "rotar un credential de Jenkins"**, del
+  hallazgo del Organization Folder de arriba -- cualquier proyecto
+  nuevo que use un Organization Folder / Multibranch Pipeline de
+  Jenkins debe recordar explícitamente que ese job se crea a mano por
+  UI (decisión del ticket 049, JCasC nunca lo gestiona), así que
+  cualquier credential que referencie queda **fuera** del control de
+  versiones y de cualquier rotación automática vía JCasC -- si el
+  credential que usa se retira o se reemplaza (como pasó aquí), hay
+  que acordarse de actualizar ESE job también, a mano, por UI. Un
+  runbook explícito con este paso evita que el próximo cambio de
+  credential se tope con la misma sorpresa sin saber por qué.
 - **Hook/check de CI nuevo candidato**: validar en un job dedicado (o
   como parte de un template reusable de `~/dev-infra/ci-templates/`)
   que todo workflow que lea un secreto en runtime desde una fuente
@@ -1734,12 +1820,12 @@ este repo/agente (señalado explícitamente, no asumido como hecho).
   mano en `ci.yml`, pero un lint/check automático lo haría
   estructural para cualquier proyecto nuevo, no dependiente de que
   cada agente se acuerde.
-- **Segundo hook/check candidato, nuevo de este ticket**: cuando un
-  script administrativo de Vault (`migrate-infra-secrets.sh` y
-  similares) escribe a un path que otros mecanismos también escriben
-  (`secret/jenkins`), usar `kv patch` en vez de `kv put` por default
-  -- un lint simple podría marcar cualquier `vault kv put` sobre un
-  path ya usado por más de un consumidor.
+- **Segundo hook/check candidato**: cuando un script administrativo de
+  Vault (`migrate-infra-secrets.sh` y similares) escribe a un path que
+  otros mecanismos también escriben (`secret/jenkins`), usar
+  `kv patch` en vez de `kv put` por default -- un lint simple podría
+  marcar cualquier `vault kv put` sobre un path ya usado por más de un
+  consumidor.
 - Habilitar `secret_scanning_push_protection` a nivel de repo/org en
   GitHub (confirmado deshabilitado en `64bitstudio/platform` durante
   este ticket, `security_and_analysis.secret_scanning_push_protection.status:
