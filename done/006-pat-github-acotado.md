@@ -162,14 +162,13 @@ de todo lo de abajo, con logs y evidencia real:
   y sin regresión.
 - **PAT viejo retirado de todo el wiring de Jenkins** (JCasC —
   `casc/jenkins.yaml`, `docker-compose.yml` — y el Organization
-  Folder, ambos confirmados limpios). **Pendiente, fuera del alcance
-  de este repo/agente, señalado explícitamente**: revocar el token del
-  PAT en sí en la cuenta de GitHub de Marco — el valor real sigue vivo
-  (sin limpiar) en `secret/jenkins` de Vault como artefacto histórico.
-  Este criterio de aceptación específico ("dado el PAT viejo ya
-  revocado, cualquier intento de usarlo falla") **no se da por
-  cumplido todavía** — requiere una acción de Marco en su cuenta
-  personal de GitHub, no un cambio de código.
+  Folder, ambos confirmados limpios) **y revocado por Marco en su
+  cuenta de GitHub (2026-09-02, confirmado por él directamente)** —
+  con esto el último criterio de aceptación pendiente ("dado el PAT
+  viejo ya revocado, cualquier intento de usarlo falla") queda
+  cumplido. El valor histórico del token sigue en `secret/jenkins` de
+  Vault como artefacto sin limpiar (ya inerte, el token en sí no
+  funciona) — limpieza cosmética opcional, no bloquea el cierre.
 
 PRs: `platform#22` (mergeado), `platform#23`, `auth-core-mc#90`
 (mergeado a `dev`).
