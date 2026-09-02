@@ -11,9 +11,11 @@
 # romper el arranque completo de Jenkins por un error de sintaxis en el
 # DSL no valía la pena por algo que Marco hace una sola vez.
 #
-# JENKINS_ADMIN_USER/JENKINS_ADMIN_PASSWORD/GITHUB_PAT vienen del
-# entorno del contenedor (ver docker-compose.yml, que los toma de
-# /home/ubuntu/secrets/jenkins/.env — NUNCA hardcodeados aquí).
+# JENKINS_ADMIN_USER/JENKINS_ADMIN_PASSWORD/GITHUB_APP_ID/
+# GITHUB_APP_PRIVATE_KEY_B64 vienen del entorno del contenedor (ver
+# docker-compose.yml, que los toma de /home/ubuntu/secrets/jenkins/.env
+# — NUNCA hardcodeados aquí). GITHUB_PAT (ticket 049) ya NO se consume
+# en este archivo desde el ticket 006 -- ver "credentials:" más abajo.
 # JENKINS_ADMIN_USER/PASSWORD ya no se consumen en ESTE archivo (la
 # seguridad se gestiona por UI, ver más abajo) pero siguen
 # necesitándose en docker-compose.yml/el .env para el resto del flujo
@@ -66,15 +68,17 @@ credentials:
   system:
     domainCredentials:
       - credentials:
-          - usernamePassword:
-              scope: GLOBAL
-              id: "github-pat"
-              username: "marco-cortes"
-              password: "${GITHUB_PAT:-}"
-              description: >
-                PAT de GitHub para checkout/webhook/push de Jenkins
-                (auth-core-mc + mail-core-mc). Generado por Marco,
-                nunca en git -- ver docs/ARQUITECTURA.md ticket 049.
+          # Ticket 006: "github-pat" (PAT compartido de la cuenta personal
+          # de Marco, usado desde el ticket 049 para checkout/webhook/push
+          # de Jenkins) RETIRADO de aquí -- reemplazado por completo por el
+          # credential "github-app" más abajo, verificado de punta a punta
+          # (ver su descripción y docs/ARQUITECTURA.md ticket 006: la
+          # GitHub App SÍ rechaza el bypass de branch protection que el PAT
+          # dejaba pasar, deploy real a dev sin regresión). El valor real
+          # del PAT sigue existiendo en secret/jenkins de Vault (histórico,
+          # sin limpiar) y como GITHUB_PAT en docker-compose.yml -- el PAT
+          # en sí (el token de GitHub) debe revocarse aparte, en la cuenta
+          # de Marco (acción suya, fuera del alcance de este repo/agente).
           - string:
               scope: GLOBAL
               id: "sonar-token"
@@ -104,6 +108,38 @@ credentials:
                 y obtener un token de Vault de vida corta (15m) --
                 nunca un token maestro guardado. Generado por
                 deploy/vm-infra/vault/bootstrap-jenkins-approle.sh.
+          - gitHubApp:
+              scope: GLOBAL
+              id: "github-app"
+              appID: "${GITHUB_APP_ID:-}"
+              privateKey: "${GITHUB_APP_PRIVATE_KEY:-}"
+              description: >
+                Ticket 006 (docs/definiciones/vault-secrets-manager-vm.md,
+                HU-9): GitHub App "64bitstudio-jenkins-ci" -- reemplaza al
+                PAT compartido de la cuenta personal de Marco (retirado de
+                este archivo). Hallazgo real que motivó el cambio (probado
+                en vivo, no asumido): un PAT fine-grained SIN
+                "Administration" seguía dejando pasar un push directo a
+                una rama protegida con el mismo aviso de "Bypassed rule
+                violations" del incidente del ticket 002 -- el bypass está
+                atado a que la cuenta de Marco es owner de la
+                organización, no a los permisos que el token declare. Una
+                GitHub App tiene su propia identidad (no la de ningún
+                usuario humano), así que nunca hereda ese bypass.
+                GitHubAppCredentials implementa
+                StandardUsernamePasswordCredentials -- funciona como
+                reemplazo directo de "github-pat" en cualquier
+                withCredentials/checkout existente, sin cambiar la forma
+                en que se usa, solo el id. Los tokens de instalación que
+                genera son de corta vida (~1h) y se renuevan solos --
+                nunca un secreto de larga duración guardado (confirmado
+                en vivo: installation token real obtenido vía el flujo JWT
+                completo, expiración real ~1h, ver docs/ARQUITECTURA.md
+                ticket 006). Verificado de punta a punta: la prueba de
+                bypass (rama con la misma protección real de dev) fue
+                RECHAZADA por GitHub, a diferencia del PAT viejo -- y el
+                deploy real a dev de auth-core-mc siguió funcionando sin
+                regresión con este credential.
 
 unclassified:
   location:
@@ -135,23 +171,32 @@ unclassified:
             scm:
               git:
                 remote: "https://github.com/64bitstudio/platform.git"
-                credentialsId: "github-pat"
+                credentialsId: "github-app"
   # Ticket 002, punto 6 (investigado antes de asumir que hacía falta un
   # webhook manual por repo -- ver docs/ARQUITECTURA.md, runbook "conectar
   # un proyecto nuevo"): SÍ existe un mecanismo a nivel de organización.
-  # Con "Manage hooks" activado aquí (mismo credential "github-pat" que ya
-  # usa el Organization Folder para escanear 64bitstudio), el plugin
-  # "github" crea/actualiza automáticamente el webhook push de CUALQUIER
-  # repo que el Organization Folder descubra (branch con Jenkinsfile) --
-  # ya no hace falta `POST /repos/<owner>/<repo>/hooks` a mano ni por
-  # script para ningún core nuevo. El webhook ya existente de
-  # auth-core-mc (creado a mano el 2026-08-31) queda re-gestionado por
-  # este mecanismo a partir de aquí (misma URL:
-  # https://jenkins.64bitstudio.com/github-webhook/, sin cambio real).
+  # Con "Manage hooks" activado aquí, el plugin "github" crea/actualiza
+  # automáticamente el webhook push de CUALQUIER repo que el Organization
+  # Folder descubra (branch con Jenkinsfile) -- ya no hace falta
+  # `POST /repos/<owner>/<repo>/hooks` a mano ni por script para ningún
+  # core nuevo. El webhook ya existente de auth-core-mc (creado a mano el
+  # 2026-08-31) queda re-gestionado por este mecanismo a partir de aquí
+  # (misma URL: https://jenkins.64bitstudio.com/github-webhook/, sin
+  # cambio real).
+  #
+  # Ticket 006: credential cambiado de "github-pat" a "github-app" --
+  # mismo mecanismo, identidad distinta (ver el comentario completo en
+  # "credentials:" arriba). La GitHub App además trae su PROPIO webhook
+  # (configurado una vez al crearla, entrega eventos automáticamente para
+  # cualquier repo donde se instale) -- "manageHooks" sigue en true por
+  # compatibilidad con bootstrap-project-branches.sh (ticket 002, que
+  # sigue creando el webhook por repo vía `gh api` con su propia sesión,
+  # no con este credential), no porque siga siendo estrictamente
+  # necesario para repos nuevos que ya tengan la App instalada.
   gitHubPluginConfig:
     configs:
       - name: "github.com (64bitstudio)"
         apiUrl: "https://api.github.com"
-        credentialsId: "github-pat"
+        credentialsId: "github-app"
         manageHooks: true
         clientCacheSize: 20

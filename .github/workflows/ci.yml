@@ -235,6 +235,7 @@ jobs:
           LOGIN_OUT=$(docker exec vault vault write -format=json auth/approle/login \
             role_id="$(cat "$ROLE_ID_FILE")" secret_id="$(cat "$SECRET_ID_FILE")" 2>/dev/null || echo "")
           TOKEN=$(echo "$LOGIN_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['auth']['client_token'])" 2>/dev/null || echo "")
+          if [ -n "$TOKEN" ]; then echo "::add-mask::$TOKEN"; fi
           if [ -z "$TOKEN" ]; then
             echo "::warning::No se pudo autenticar contra Vault (¿sigue sellado?) -- se omite este paso."
             exit 0
@@ -270,11 +271,13 @@ jobs:
           LOGIN_OUT=$(docker exec vault vault write -format=json auth/approle/login \
             role_id="$(cat "$ROLE_ID_FILE")" secret_id="$(cat "$SECRET_ID_FILE")" 2>/dev/null || echo "")
           TOKEN=$(echo "$LOGIN_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['auth']['client_token'])" 2>/dev/null || echo "")
+          if [ -n "$TOKEN" ]; then echo "::add-mask::$TOKEN"; fi
           if [ -z "$TOKEN" ]; then
             echo "Vault no alcanzable -- se omite, el archivo local existente queda intacto (rollback real, HU-4)."
             exit 0
           fi
           VAULT_VALUE=$(docker exec -e VAULT_TOKEN="$TOKEN" vault vault kv get -field=htpasswd secret/nginx/basic-auth 2>/dev/null || echo "")
+          if [ -n "$VAULT_VALUE" ]; then echo "::add-mask::$VAULT_VALUE"; fi
           if [ -z "$VAULT_VALUE" ]; then
             echo "secret/nginx/basic-auth no existe todavía en Vault -- se omite (nada que migrar aún)."
             exit 0
@@ -304,6 +307,88 @@ jobs:
             echo "Creado $ENVFILE (password generado, no impreso). GITHUB_PAT queda vacío -- Marco debe llenarlo a mano."
           fi
 
+      # Ticket 006 -- hallazgo real (encontrado verificando de punta a
+      # punta, no solo revisando código): TELEGRAM_BOT_TOKEN/CHAT_ID en
+      # secret/jenkins llevaban en blanco (longitud 0, campo presente
+      # pero vacío) a pesar de que el cierre del ticket 004 reportó
+      # haberlos migrado. Causa raíz más probable (ver
+      # docs/ARQUITECTURA.md ticket 006 para el detalle completo):
+      # deploy/vm-infra/vault/migrate-infra-secrets.sh hace un
+      # "vault kv put secret/jenkins" -- un REEMPLAZO COMPLETO del path,
+      # no un merge -- con solo 4 campos codeados a mano (GITHUB_PAT,
+      # SONAR_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID), leyendo sus
+      # valores del .env LOCAL de la VM en ese momento. Si ese script se
+      # re-corrió en algún punto posterior (p.ej. durante el propio
+      # ticket 006, para "refrescar" secretos) con TELEGRAM_BOT_TOKEN/
+      # CHAT_ID en blanco en el .env local (nada los llena ahí
+      # automáticamente -- ci.yml los consume directo de
+      # `secrets.TELEGRAM_*` para sus propias notificaciones, nunca los
+      # escribe de vuelta al .env), ese "put" completo sobreescribió
+      # secret/jenkins ENTERO con esos 2 campos en blanco. El propio
+      # comentario del script ("seguro de re-correr") es la causa
+      # raíz del riesgo -- ya NO es seguro desde que secret/jenkins
+      # creció a más campos que los 4 que el script conoce (GITHUB_APP_ID,
+      # GITHUB_APP_PRIVATE_KEY) -- corregido en el script (usa
+      # "kv patch" ahora, ver ese archivo).
+      #
+      # Este paso se auto-repara: si Vault tiene esos 2 campos vacíos Y
+      # ya existen como GitHub Actions Secrets de este repo (ya
+      # confirmados reales -- son los mismos que usan los pasos
+      # "Verificar sello de Vault"/"Notify success"/"Notify failure" de
+      # este mismo archivo), los restaura con un merge real (lee
+      # secret/jenkins completo, solo reemplaza esos 2 campos, escribe
+      # de vuelta) -- nunca pide credenciales nuevas, nunca pisa ningún
+      # otro campo (GITHUB_PAT/SONAR_TOKEN/GITHUB_APP_ID/
+      # GITHUB_APP_PRIVATE_KEY quedan intactos).
+      - name: Auto-reparar TELEGRAM_BOT_TOKEN/CHAT_ID de Jenkins en Vault si están vacíos (ticket 006)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          ROLE_ID_FILE=/home/ubuntu/secrets/vault/platform-admin-role-id
+          SECRET_ID_FILE=/home/ubuntu/secrets/vault/platform-admin-secret-id
+          if [ ! -f "$ROLE_ID_FILE" ] || [ ! -f "$SECRET_ID_FILE" ]; then
+            echo "::warning::AppRole platform-admin no existe todavía -- se omite este paso."
+            exit 0
+          fi
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "TELEGRAM_BOT_TOKEN/CHAT_ID no están configurados como GitHub Actions Secrets de este repo todavía -- se omite este paso (nada que restaurar)."
+            exit 0
+          fi
+          LOGIN_OUT=$(docker exec vault vault write -format=json auth/approle/login \
+            role_id="$(cat "$ROLE_ID_FILE")" secret_id="$(cat "$SECRET_ID_FILE")" 2>/dev/null || echo "")
+          TOKEN=$(echo "$LOGIN_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['auth']['client_token'])" 2>/dev/null || echo "")
+          if [ -n "$TOKEN" ]; then echo "::add-mask::$TOKEN"; fi
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::No se pudo autenticar contra Vault (¿sigue sellado?) -- se omite este paso."
+            exit 0
+          fi
+          CURRENT_JSON=$(docker exec -e VAULT_TOKEN="$TOKEN" vault vault kv get -format=json secret/jenkins 2>/dev/null || echo '{"data":{"data":{}}}')
+          NEEDS_FIX=$(echo "$CURRENT_JSON" | python3 -c "
+          import json,sys
+          d = json.load(sys.stdin)['data']['data']
+          print('yes' if not d.get('TELEGRAM_BOT_TOKEN') or not d.get('TELEGRAM_CHAT_ID') else 'no')
+          ")
+          if [ "$NEEDS_FIX" != "yes" ]; then
+            echo "TELEGRAM_BOT_TOKEN/CHAT_ID ya tienen valor real en Vault -- sin cambios."
+            exit 0
+          fi
+          echo "::warning::secret/jenkins tenía TELEGRAM_BOT_TOKEN y/o TELEGRAM_CHAT_ID vacíos -- restaurando desde los GitHub Actions Secrets de este repo (merge completo, sin tocar ningún otro campo)."
+          MERGED_JSON=$(echo "$CURRENT_JSON" | TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID" python3 -c "
+          import json, os, sys
+          current = json.load(sys.stdin)['data']['data']
+          current['TELEGRAM_BOT_TOKEN'] = os.environ['TELEGRAM_BOT_TOKEN']
+          current['TELEGRAM_CHAT_ID'] = os.environ['TELEGRAM_CHAT_ID']
+          print(json.dumps(current))
+          ")
+          echo "$MERGED_JSON" > /tmp/.merged-secret-jenkins.json
+          docker cp /tmp/.merged-secret-jenkins.json vault:/tmp/merged-secret-jenkins.json
+          docker exec -u root vault chown vault:vault /tmp/merged-secret-jenkins.json
+          docker exec -e VAULT_TOKEN="$TOKEN" vault vault kv put secret/jenkins @/tmp/merged-secret-jenkins.json >/dev/null
+          docker exec -u root vault rm -f /tmp/merged-secret-jenkins.json
+          rm -f /tmp/.merged-secret-jenkins.json
+          echo "OK: TELEGRAM_BOT_TOKEN/CHAT_ID restaurados en Vault (merge completo, ningún otro campo tocado)."
+
       # Ticket 004 (HU-1 completa): GITHUB_PAT/SONAR_TOKEN/TELEGRAM_* de
       # Jenkins, renderizados DESDE Vault (secret/jenkins) en cada
       # corrida -- a partir de este ticket, Vault es la fuente de
@@ -328,6 +413,7 @@ jobs:
           LOGIN_OUT=$(docker exec vault vault write -format=json auth/approle/login \
             role_id="$JENKINS_ROLE_ID" secret_id="$JENKINS_SECRET_ID" 2>/dev/null || echo "")
           TOKEN=$(echo "$LOGIN_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['auth']['client_token'])" 2>/dev/null || echo "")
+          if [ -n "$TOKEN" ]; then echo "::add-mask::$TOKEN"; fi
           if [ -z "$TOKEN" ]; then
             echo "Vault no alcanzable/sellado -- se omite, el .env existente queda intacto (rollback real, HU-4)."
             exit 0
@@ -337,9 +423,20 @@ jobs:
             echo "secret/jenkins no existe todavía en Vault -- se omite (nada que sincronizar aún)."
             exit 0
           fi
-          for VAR in GITHUB_PAT SONAR_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID; do
+          # Hallazgo real (ticket 006, ver docs/ARQUITECTURA.md): ningún
+          # secreto leído de Vault en runtime pasaba por el mecanismo de
+          # enmascarado de logs de GitHub Actions (ese mecanismo solo
+          # cubre valores registrados vía "secrets.*" del propio workflow
+          # -- nada de lo que se lee aquí, en tiempo de ejecución, desde
+          # Vault, calificaba). "::add-mask::" registra cada valor ante
+          # el runner en cuanto se lee, para el resto del job completo --
+          # mitigación de defensa en profundidad, independiente de la
+          # causa raíz puntual del leak real (ver
+          # docker-entrypoint-wrapper.sh/Dockerfile para esa causa raíz).
+          for VAR in GITHUB_PAT SONAR_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID GITHUB_APP_ID; do
             VALUE=$(echo "$SECRET_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['data'].get('$VAR',''))")
             if [ -n "$VALUE" ]; then
+              echo "::add-mask::$VALUE"
               if grep -q "^${VAR}=" "$ENVFILE"; then
                 sed -i "s#^${VAR}=.*#${VAR}=${VALUE}#" "$ENVFILE"
               else
@@ -347,6 +444,23 @@ jobs:
               fi
             fi
           done
+          # Ticket 006: GITHUB_APP_PRIVATE_KEY_B64 -- la llave de la
+          # GitHub App, codificada en base64 (una sola línea) antes de
+          # escribirla en el .env. Vault guarda el PEM real
+          # (multilínea); codificarla aquí, justo antes de escribir el
+          # .env línea-por-línea, evita el hallazgo real de Docker
+          # Compose rompiendo su propio YAML con un valor multilínea
+          # (ver docker-entrypoint-wrapper.sh, que la decodifica de
+          # vuelta dentro del contenedor).
+          APPKEY_B64=$(echo "$SECRET_JSON" | python3 -c "import json,sys,base64; key = json.load(sys.stdin)['data']['data'].get('GITHUB_APP_PRIVATE_KEY',''); print(base64.b64encode(key.encode()).decode() if key else '')")
+          if [ -n "$APPKEY_B64" ]; then
+            echo "::add-mask::$APPKEY_B64"
+            if grep -q '^GITHUB_APP_PRIVATE_KEY_B64=' "$ENVFILE"; then
+              sed -i "s#^GITHUB_APP_PRIVATE_KEY_B64=.*#GITHUB_APP_PRIVATE_KEY_B64=${APPKEY_B64}#" "$ENVFILE"
+            else
+              printf 'GITHUB_APP_PRIVATE_KEY_B64=%s\n' "$APPKEY_B64" >> "$ENVFILE"
+            fi
+          fi
           echo "Secretos de Jenkins sincronizados desde Vault (valores no impresos)."
 
       # SONAR_TOKEN de Jenkins: red de seguridad de PRIMERA VEZ (Vault
@@ -455,16 +569,44 @@ jobs:
       # define (Dockerfile o plugins.txt) cambió, comparando contra un
       # hash guardado fuera del checkout -- evita recrear/reiniciar
       # Jenkins en cada push (hallazgo real de auth-core-mc, ticket 049).
+      #
+      # Ticket 006: este paso es el que recrea el contenedor de Jenkins
+      # con GITHUB_APP_PRIVATE_KEY_B64 nuevo cuando cambia -- disparado a
+      # propósito para la verificación real de la llave nueva de la
+      # GitHub App (ver docs/ARQUITECTURA.md).
       - name: Jenkins (orquestador del pipeline, compartido de la VM)
         run: |
+          # Hallazgo real (ticket 006, reproducido con una llave RSA falsa
+          # antes de tocar la real -- ver docs/ARQUITECTURA.md): un valor
+          # multilínea sin comillas escrito alguna vez en este .env (p.ej.
+          # una versión vieja/con bug de "Sincronizar secretos de Jenkins
+          # desde Vault" que escribiera GITHUB_APP_PRIVATE_KEY crudo en vez
+          # de solo la variante _B64) rompe por completo este "source":
+          # bash interpreta cada línea del cuerpo del PEM como un comando
+          # nuevo -- "command not found" (exit 127), abortando el step
+          # aquí mismo (por el "-e" del shell de GitHub Actions) ANTES de
+          # llegar siquiera a "docker compose up", e IMPRIMIENDO al menos
+          # un fragmento real de la llave en un log público en el proceso.
+          # El código actual ya NO escribe esa clave cruda (ver
+          # "Sincronizar secretos de Jenkins desde Vault" más arriba, solo
+          # escribe GITHUB_APP_PRIVATE_KEY_B64) -- esto es una barrera
+          # defensiva adicional, no el mecanismo real: si por cualquier
+          # motivo futuro ese artefacto vuelve a aparecer en el .env, se
+          # detecta y se quita ANTES de sourcearlo, con un aviso (nunca el
+          # valor) en vez de abortar el step imprimiendo fragmentos.
+          ENVFILE=/home/ubuntu/secrets/jenkins/.env
+          if grep -q '^GITHUB_APP_PRIVATE_KEY=' "$ENVFILE" 2>/dev/null; then
+            echo "::warning::Entrada cruda GITHUB_APP_PRIVATE_KEY= (no _B64) encontrada en $ENVFILE -- artefacto inesperado, se elimina (línea completa + cuerpo del PEM hasta su propio END) antes de sourcear el archivo (nunca debería escribirse así, ver docker-entrypoint-wrapper.sh)."
+            sed -i '/^GITHUB_APP_PRIVATE_KEY=/,/-----END PRIVATE KEY-----/d' "$ENVFILE"
+          fi
           set -a
-          . /home/ubuntu/secrets/jenkins/.env
+          . "$ENVFILE"
           set +a
           export DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
           export UBUNTU_GID=$(id -g ubuntu)
 
           HASH_FILE=/home/ubuntu/secrets/jenkins/.image-inputs-hash
-          NEW_HASH=$(sha256sum deploy/vm-infra/jenkins/Dockerfile deploy/vm-infra/jenkins/plugins.txt | sha256sum | cut -d' ' -f1)
+          NEW_HASH=$(sha256sum deploy/vm-infra/jenkins/Dockerfile deploy/vm-infra/jenkins/plugins.txt deploy/vm-infra/jenkins/docker-entrypoint-wrapper.sh | sha256sum | cut -d' ' -f1)
           if [ -f "$HASH_FILE" ] && [ "$(cat "$HASH_FILE")" = "$NEW_HASH" ]; then
             echo "Dockerfile/plugins.txt de Jenkins sin cambios -- 'up -d' sin --build (evita recrear/reiniciar Jenkins en cada push; docker compose igual recrea el contenedor si algo de su config SÍ cambió, p.ej. un GID o un secret nuevo)."
             docker compose -f deploy/vm-infra/jenkins/docker-compose.yml up -d
@@ -496,6 +638,7 @@ jobs:
         run: |
           SONAR_HOST_URL_LOCAL="http://127.0.0.1:9000"
           SONAR_TOKEN=$(grep '^SONAR_TOKEN=' /home/ubuntu/secrets/jenkins/.env | cut -d= -f2-)
+          if [ -n "${SONAR_TOKEN:-}" ]; then echo "::add-mask::$SONAR_TOKEN"; fi
           if [ -z "${SONAR_TOKEN:-}" ]; then
             echo "SONAR_TOKEN vacío en el .env de Jenkins -- se omite (Marco todavía no lo llenó)." >&2
             exit 0

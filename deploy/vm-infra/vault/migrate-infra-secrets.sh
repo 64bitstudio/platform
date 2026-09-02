@@ -11,9 +11,22 @@
 # vars/corePipeline.groovy, que ahora los usa como destino RENDERIZADO,
 # no como fuente de verdad).
 #
-# Idempotente: vault kv put sobreescribe (crea una versión nueva, KV v2
-# mantiene el historial) -- seguro de re-correr si algún valor local
-# cambia y hay que re-sincronizar a mano.
+# Idempotente para secret/auth-core-mc/* y secret/nginx/basic-auth (paths
+# dedicados, sin otros campos que preservar).
+#
+# Hallazgo real (ticket 006, causa raíz de TELEGRAM_BOT_TOKEN/CHAT_ID
+# encontrados en blanco en Vault -- ver docs/ARQUITECTURA.md): para
+# secret/jenkins ESTE COMENTARIO ERA FALSO. "vault kv put" reemplaza el
+# path COMPLETO, no hace merge -- este script solo conocía 4 campos
+# (GITHUB_PAT/SONAR_TOKEN/TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID). Desde que
+# secret/jenkins creció (GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY del
+# ticket 006), un re-run de este script con el .env local del momento
+# incompleto (p.ej. TELEGRAM_* nunca se llenan ahí automáticamente --
+# ci.yml los consume directo de los GitHub Actions Secrets del repo,
+# nunca los escribe de vuelta al .env local) BORRABA en silencio
+# cualquier campo que este script no conociera. Corregido: secret/jenkins
+# ahora usa "vault kv patch" (merge real, respeta lo que ya había) en vez
+# de "kv put".
 #
 # Uso (desde la VM):
 #   ./migrate-infra-secrets.sh
@@ -50,7 +63,7 @@ GITHUB_PAT=$(get_env_var "$JFILE" "GITHUB_PAT")
 SONAR_TOKEN=$(get_env_var "$JFILE" "SONAR_TOKEN")
 TELEGRAM_BOT_TOKEN=$(get_env_var "$JFILE" "TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID=$(get_env_var "$JFILE" "TELEGRAM_CHAT_ID")
-run kv put secret/jenkins \
+run kv patch secret/jenkins \
   GITHUB_PAT="$GITHUB_PAT" \
   SONAR_TOKEN="$SONAR_TOKEN" \
   TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" \

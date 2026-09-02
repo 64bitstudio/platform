@@ -59,3 +59,27 @@ USER jenkins
 COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
 RUN jenkins-plugin-cli --plugin-file /usr/share/jenkins/ref/plugins.txt
 
+# Ticket 006: hallazgo real (primer intento de pasar la llave privada de
+# la GitHub App como env var de Docker Compose) -- Compose interpola
+# "${VAR}" como texto plano ANTES de parsear el YAML del compose file;
+# un valor multilínea (la llave PEM real) rompe la estructura YAML
+# resultante y el error observado en vivo fue "Process completed with
+# exit code 127" con fragmentos de la llave impresos como si fueran
+# comandos. Solución estándar para este problema conocido (env vars
+# multilínea a través de Docker Compose): el valor viaja codificado en
+# base64 (una sola línea, seguro para la interpolación de Compose,
+# ver docker-compose.yml -- GITHUB_APP_PRIVATE_KEY_B64) y se decodifica
+# AQUÍ, dentro del propio contenedor, antes de que Jenkins arranque --
+# nunca pasa por la capa de interpolación de Compose en su forma real
+# multilínea.
+USER root
+COPY docker-entrypoint-wrapper.sh /usr/local/bin/docker-entrypoint-wrapper.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint-wrapper.sh
+USER jenkins
+# Mismo ENTRYPOINT/CMD que la imagen base (tini -- jenkins.sh), con el
+# wrapper de arriba insertado antes de tini -- comportamiento idéntico
+# salvo por el decode de la llave, "exec" preserva a tini como PID 1
+# real (reaping de zombies intacto).
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint-wrapper.sh"]
+CMD ["/usr/local/bin/jenkins.sh"]
+

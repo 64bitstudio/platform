@@ -55,7 +55,9 @@ services:
       JAVA_OPTS: "-Xmx1536m -Djenkins.install.runSetupWizard=false"
       JENKINS_ADMIN_USER: ${JENKINS_ADMIN_USER:?falta JENKINS_ADMIN_USER en /home/ubuntu/secrets/jenkins/.env}
       JENKINS_ADMIN_PASSWORD: ${JENKINS_ADMIN_PASSWORD:?falta JENKINS_ADMIN_PASSWORD en /home/ubuntu/secrets/jenkins/.env}
-      GITHUB_PAT: ${GITHUB_PAT:-}
+      # GITHUB_PAT (ticket 049) retirado de aquí en el ticket 006 -- el
+      # credential "github-pat" ya no existe en casc/jenkins.yaml (ver ese
+      # archivo), así que ya nada dentro del contenedor lo consume.
       SONAR_HOST_URL: ${SONAR_HOST_URL:-http://sonarqube:9000}
       SONAR_TOKEN: ${SONAR_TOKEN:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
@@ -67,6 +69,26 @@ services:
       # "vault-jenkins-secret-id"), consumido por
       # vars/corePipeline.groovy en cada deploy.
       VAULT_JENKINS_SECRET_ID: ${VAULT_JENKINS_SECRET_ID:-}
+      # Ticket 006 (docs/definiciones/vault-secrets-manager-vm.md, HU-9):
+      # GitHub App "64bitstudio-jenkins-ci" -- reemplaza al PAT compartido
+      # de la cuenta personal de Marco (hallazgo real: un PAT fine-grained
+      # acotado seguía heredando el bypass de branch protection porque
+      # autentica como su cuenta de owner de la organización; una GitHub
+      # App tiene su propia identidad, sin ese heredo). GITHUB_APP_ID no
+      # es secreto.
+      #
+      # Hallazgo real (primer intento): GITHUB_APP_PRIVATE_KEY es
+      # multilínea (PEM real) -- Docker Compose interpola "${VAR}" como
+      # TEXTO PLANO antes de parsear su propio YAML, así que un valor
+      # multilínea rompe la estructura del compose file resultante
+      # (visto en vivo: "exit code 127", fragmentos de la llave
+      # ejecutados como si fueran comandos). Se pasa codificada en
+      # base64 (una sola línea, segura para esa interpolación) y se
+      # decodifica DENTRO del contenedor, antes de que Jenkins arranque
+      # (ver docker-entrypoint-wrapper.sh) -- JCasC nunca ve el valor
+      # sin decodificar.
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY_B64: ${GITHUB_APP_PRIVATE_KEY_B64:-}
     volumes:
       - jenkins_home:/var/jenkins_home
       - /var/run/docker.sock:/var/run/docker.sock
