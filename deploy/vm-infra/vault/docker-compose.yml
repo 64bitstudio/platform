@@ -7,14 +7,18 @@
 # backend Raft integrado (single-node), auto-unseal vía OCI KMS (ver
 # ./config/vault.hcl para el porqué completo de cada opción).
 #
-# Sin labels de Traefik/red "edge" a propósito -- Vault NO se expone a
-# internet en esta primera versión (ninguna HU del documento de
-# definición lo pide); solo alcanzable desde dentro de la VM (127.0.0.1,
-# uso administrativo) y desde otros contenedores de la red interna
-# "vm-infra" (Jenkins hoy, el backend de auth-core-mc desde el ticket
-# 005). Revisar esta decisión si en el futuro hiciera falta acceso a la
-# UI de Vault desde fuera de la VM (agregaría el mismo patrón de Basic
-# Auth de nginx que ya usan sonarqube/traefik/portainer).
+# Ticket platform/007 (retiro del Vault local de la Mac de Marco):
+# se agregan labels de Traefik + red "edge" -- Vault SÍ se expone ahora a
+# internet, en vault.64bitstudio.com, para que el desarrollo local en la
+# Mac de Marco pueda usar el motor Transit sin depender de un Vault local
+# propio. Ver nginx/vault.conf para el diseño completo de la exposición
+# (allowlist de rutas + rate limiting en vez de Basic Auth compartido, y
+# por qué) y docs/ARQUITECTURA.md ticket 007 para el registro del VoBo de
+# Marco antes de aplicar esto de forma definitiva. El puerto 8200 sigue
+# también publicado solo en 127.0.0.1 (uso administrativo directo desde la
+# propia VM) y alcanzable desde la red interna "vm-infra" (Jenkins, el
+# backend de auth-core-mc en DEV/QA/PROD -- ese tráfico sigue siendo
+# 100% interno, nunca pasa por este subdominio público).
 name: vm-infra-vault
 
 services:
@@ -57,9 +61,18 @@ services:
     networks:
       - default
       - vm-infra
+      - edge
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.vault.rule=Host(`vault.64bitstudio.com`)"
+      - "traefik.http.routers.vault.entrypoints=web"
+      - "traefik.http.services.vault.loadbalancer.server.port=8200"
 
 networks:
   vm-infra:
+    external: true
+  edge:
     external: true
 
 volumes:
