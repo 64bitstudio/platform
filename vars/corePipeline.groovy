@@ -365,7 +365,20 @@ def call(Map config) {
                     if (env.TELEGRAM_BOT_TOKEN?.trim()) {
                         def emoji = currentBuild.currentResult == 'SUCCESS' ? '✅' : '🔴'
                         def msg = "*${emoji} [${project}] Jenkins ${env.BRANCH_NAME}*\n${currentBuild.currentResult} -- ${env.BUILD_URL}"
+                        // Hallazgo real (ticket 011 de mail-core-mc, primer build real
+                        // de su Jenkinsfile): igual que el token de Vault (ticket 004,
+                        // ver fetchAndPatchDbPasswordFromVault) -- el `sh` de Jenkins
+                        // corre con `set -x` por default, así que sin `set +x` explícito
+                        // este comando quedaba impreso en el log de consola CON
+                        // TELEGRAM_BOT_TOKEN ya resuelto en texto plano
+                        // ("+ curl ... https://api.telegram.org/bot<token real>/..."),
+                        // visible para cualquiera con acceso a los logs de Jenkins --
+                        // en TODOS los builds de TODOS los cores (post{always} corre
+                        // siempre, éxito o falla). No se rota el token aquí (fuera de
+                        // alcance de este fix puntual) -- reportado a Marco para que
+                        // decida si rotarlo.
                         sh """
+                            set +x
                             curl -sS -X POST "https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage" \\
                                 -d chat_id=${env.TELEGRAM_CHAT_ID} \\
                                 -d parse_mode=Markdown \\
