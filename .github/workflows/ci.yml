@@ -169,6 +169,43 @@ jobs:
       - name: Vault (secrets manager compartido de la VM)
         run: docker compose -f deploy/vm-infra/vault/docker-compose.yml up -d
 
+      # Ticket 007 (retiro del Vault local de la Mac de Marco): zona de
+      # rate limiting a nivel http{} que usa el vhost de Vault (ver
+      # nginx/rate-limits.conf) -- va en conf.d/, no en sites-enabled/,
+      # porque "limit_req_zone" solo puede declararse en el bloque http{}.
+      - name: nginx -> rate limit compartido (vault login)
+        run: |
+          sudo cp deploy/vm-infra/nginx/rate-limits.conf /etc/nginx/conf.d/rate-limits.conf
+          sudo nginx -t
+          sudo systemctl reload nginx
+
+      # Ticket 007: vhost de Vault -- allowlist de 3 rutas exactas (login
+      # AppRole + encrypt/decrypt de la llave de auth-core-mc) en vez de
+      # Basic Auth compartido, ver nginx/vault.conf para el análisis
+      # completo de esta decisión de seguridad. VoBo de Marco requerido
+      # antes de que este paso corra contra la VM real la primera vez --
+      # ver docs/ARQUITECTURA.md ticket 007.
+      - name: nginx -> Traefik (vhost de Vault, allowlist de rutas)
+        run: |
+          sudo cp deploy/vm-infra/nginx/vault.conf /etc/nginx/sites-available/vault.conf
+          sudo ln -sf /etc/nginx/sites-available/vault.conf /etc/nginx/sites-enabled/vault.conf
+          sudo nginx -t
+          sudo systemctl reload nginx
+
+      # Certificado Let's Encrypt para Vault -- petición propia, mismo
+      # motivo que Jenkins/las 3 herramientas de infra (certbot exige que
+      # todos los SAN de una misma petición resuelvan). continue-on-error
+      # por si el DNS de vault.64bitstudio.com todavía no propagó (Marco
+      # debe crear el registro antes, mismo patrón que jenkins.64bitstudio.com
+      # en su momento). Idempotente.
+      - name: Certificado Let's Encrypt para Vault
+        continue-on-error: true
+        run: |
+          sudo certbot --nginx --non-interactive --agree-tos \
+            -m marco.cortes@64bitstudio.com \
+            -d vault.64bitstudio.com \
+            --redirect
+
       # Ticket 004 (HU-8): el propio sync-vm-infra, que ya corre en cada
       # push, verifica el sello de Vault y dispara una alerta de
       # Telegram DEDICADA (distinta de la notificación genérica de
