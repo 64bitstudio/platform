@@ -54,6 +54,46 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends temurin-25-jdk \
     && rm -rf /var/lib/apt/lists/*
 
+# Ticket 011 de mail-core-mc: toolchain Node.js + sonar-scanner CLI --
+# mismo motivo/patrón que Temurin 25 arriba (auth-core-mc), pero para un
+# core Node/NestJS en vez de Gradle. Gradle trae su propio plugin de
+# Sonar (self-contained, "./gradlew sonar") -- npm no tiene equivalente,
+# así que hace falta el CLI real de SonarScanner, que mail-core-mc/
+# Jenkinsfile activa solo dentro de su propio buildAndTest (withEnv,
+# PATH+SONAR=/opt/sonar-scanner/bin), sin tocar el resto del contenedor.
+#
+# NodeSource (mismo criterio que Adoptium para Temurin arriba: repo del
+# propio distribuidor, no un tarball genérico) -- Node 24 LTS, misma
+# versión que actions/setup-node usaba en el ci.yml retirado de
+# mail-core-mc.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# sonar-scanner CLI oficial (bundle con JRE propio, sin depender del
+# JDK 21/25 ya instalados arriba) -- descarga directa de SonarSource,
+# versión pineada (mismo criterio que el resto de este Dockerfile: nunca
+# ":latest" sin fijar). Detecta arquitectura -- la VM real es ARM64
+# (OCI Ampere), pero el Dockerfile debe seguir funcionando igual en una
+# Mac amd64/arm64 si algún día se necesita reconstruir la imagen ahí.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         amd64) SONAR_ARCH=linux-x64 ;; \
+         arm64) SONAR_ARCH=linux-aarch64 ;; \
+         *) echo "sonar-scanner: arquitectura no soportada: $ARCH" >&2; exit 1 ;; \
+       esac \
+    && SONAR_SCANNER_VERSION=6.2.1.4610 \
+    && curl -fsSL -o /tmp/sonar-scanner.zip \
+         "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${SONAR_SCANNER_VERSION}-${SONAR_ARCH}.zip" \
+    && unzip -q /tmp/sonar-scanner.zip -d /opt \
+    && mv "/opt/sonar-scanner-${SONAR_SCANNER_VERSION}-${SONAR_ARCH}" /opt/sonar-scanner \
+    && rm /tmp/sonar-scanner.zip
+
 USER jenkins
 
 COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
