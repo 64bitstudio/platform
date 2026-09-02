@@ -569,6 +569,11 @@ jobs:
       # define (Dockerfile o plugins.txt) cambió, comparando contra un
       # hash guardado fuera del checkout -- evita recrear/reiniciar
       # Jenkins en cada push (hallazgo real de auth-core-mc, ticket 049).
+      #
+      # Ticket 006: este paso es el que recrea el contenedor de Jenkins
+      # con GITHUB_APP_PRIVATE_KEY_B64 nuevo cuando cambia -- disparado a
+      # propósito para la verificación real de la llave nueva de la
+      # GitHub App (ver docs/ARQUITECTURA.md).
       - name: Jenkins (orquestador del pipeline, compartido de la VM)
         run: |
           # Hallazgo real (ticket 006, reproducido con una llave RSA falsa
