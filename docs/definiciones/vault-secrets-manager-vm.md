@@ -564,7 +564,14 @@ realmente cierre el hueco, confirmado). GitHub App gana en "máxima
 automatización": los tokens de instalación son de vida corta (~1h) y
 se renuevan solos, sin rotación manual nunca.
 
-**Pendiente de verificar con el mecanismo real** (mismo procedimiento
-de arriba, esta vez con la GitHub App en vez del PAT de prueba) -- ver
-`docs/ARQUITECTURA.md`, ticket 006, para el resultado real una vez
-confirmado, no asumido aquí por adelantado.
+**Verificado con el mecanismo real (2026-09-02)** -- mismo
+procedimiento de arriba, esta vez con la GitHub App en vez del PAT de
+prueba (installation token real, minado vía JWT firmado con la llave
+real, sin pasar por Jenkins): el push directo a una rama de prueba con
+la misma protección real de `dev` fue **RECHAZADO** por GitHub
+(`GH006: Protected branch update failed`, `protected branch hook
+declined`) -- a diferencia del PAT, que sí lo dejaba pasar. Ver
+`docs/ARQUITECTURA.md`, ticket 006, para el log completo y toda la
+evidencia (incluido el incidente real de la llave privada expuesta dos
+veces en logs públicos durante la implementación, su causa raíz, y los
+fixes aplicados).
