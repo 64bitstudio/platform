@@ -1833,3 +1833,92 @@ explícitamente, no asumido como hecho).
   antes de que llegara a un log público. Requiere decisión de Marco
   (puede generar fricción en pushes legítimos con falsos positivos) --
   señalado, no activado unilateralmente aquí.
+
+## Ticket 007 (2026-09-02, CERRADO): exponer Vault para desarrollo local, AppRole `auth-core-mc-local-dev`
+
+Motivado por `auth-core-mc/051`: retirar el Vault local de la Mac de
+Marco (`~/dev-infra`, desde el ticket 017 de ese repo) y apuntar
+desarrollo local a la MISMA Vault de la VM que ya sirve DEV/QA/PROD
+(ticket 005) -- un solo Vault real con una sola llave maestra, no dos.
+Este ticket solo cubre el lado de Vault/infra; el retiro efectivo del
+Vault local y el cambio de `application.properties` viven en
+`auth-core-mc`.
+
+**Diseño de exposición -- allowlist de rutas + rate limiting, sin Basic
+Auth compartido** (a diferencia de sonarqube/traefik/portainer,
+`vm-admin-tools.conf`): Vault ya tiene su propio sistema de
+autenticación (AppRole) diseñado para exposición controlada -- sumar una
+credencial compartida encima no protege nada real (quien tenga
+RoleID+SecretID válidos ya tiene lo que necesita) y reintroduce el
+patrón de "credencial única que abre todo lo de detrás" que AppRole
+evita por diseño. En su lugar, dos controles reales e independientes del
+propio auth de Vault (ver el razonamiento completo en los comentarios de
+`deploy/vm-infra/nginx/vault.conf`):
+1. **Allowlist de rutas exactas** (`location =`, no prefijo): nginx solo
+   reenvía `/v1/auth/approle/login`,
+   `/v1/transit/encrypt/auth-core-mc-tenant-keys` y
+   `/v1/transit/decrypt/auth-core-mc-tenant-keys` -- todo lo demás (la
+   UI, `/v1/sys/*`, cualquier otro secreto, cualquier otra llave)
+   responde `404` sin llegar a Vault. El backend desplegado (DEV/QA/PROD)
+   sigue hablando con Vault por la red interna `vm-infra`
+   (`http://vault:8200`), nunca por este subdominio público.
+2. **Rate limiting** (`deploy/vm-infra/nginx/rate-limits.conf`, 60r/m
+   con ráfaga de 20) sobre el único endpoint de login expuesto --
+   calibrado para no generar fricción real en desarrollo (`VaultTransitEncryptor`
+   hace login en cada `wrap`/`unwrap`, sin cachear token), no para "ser
+   lo más restrictivo posible" -- un SecretID de 122 bits de entropía ya
+   hace la fuerza bruta inviable con o sin este límite.
+
+**AppRole `auth-core-mc-local-dev`** (mismo patrón que `auth-core-mc-backend`
+del ticket 005): policy `auth-core-mc-transit` reutilizada tal cual
+(mismo alcance exacto -- `encrypt`/`decrypt` únicamente sobre
+`auth-core-mc-tenant-keys`, sin administración del motor), pero AppRole
+propia y separada -- decisión deliberada de no reutilizar la de
+producción, para poder revocar el acceso de desarrollo local sin afectar
+DEV/QA/PROD y viceversa. Verificada con prueba positiva + 2 negativas
+reales (403 en `secret/jenkins`, 403 al intentar rotar la llave) --
+`deploy/vm-infra/vault/bootstrap-auth-core-mc-local-dev-approle.sh`. El
+RoleID (`8f57acaa-6685-e870-1de6-fb9d8aad1e27`, no es secreto) se
+entregó como default no-secreto en `application.properties` de
+`auth-core-mc`; el SecretID se entregó directo al `backend/.env` local
+de Marco, nunca impreso.
+
+**Incidente real de git durante este ticket, y su corrección**: el
+mismo trabajo de este ticket terminó, por un accidente de rama
+compartida (`git commit --amend` aterrizando en la rama equivocada
+mientras otro trabajo concurrente de la misma sesión estaba activo en el
+mismo working directory), fusionado en `main` **vía el PR #25**
+("migración de GitHub a Forgejo", un PR de documentación que no era el
+vehículo de revisión previsto) en vez de vía el PR #28 dedicado a este
+ticket -- aplicado contra la VM real por `sync-vm-infra` (que corre en
+push a cualquier rama) antes de que el PR #28 recibiera revisión
+específica. El contenido coincidía exactamente con lo que Marco había
+aprobado (mismo diseño), pero el *proceso* no fue el acordado, y
+arrastró una versión sin corregir del rate limit (5r/m, encontrado
+después como demasiado restrictivo para el patrón real de
+`VaultTransitEncryptor`). Detectado por el propio agente ANTES de seguir
+adelante, reportado de inmediato sin intentar ocultarlo ni "arreglarlo
+en silencio", corregido (`git branch -f` sobre la rama afectada, sin
+tocar su contenido real) y comunicado explícitamente antes de cualquier
+otro push. El PR #28 se resolvió después contra el `main` ya actualizado
+(conflicto real de "add/add" sobre los mismos 2 archivos), quedando
+reducido de facto al fix del rate limit (60r/m) -- verificado en vivo
+por SSH tras el merge. **Candidato a `dev-org-hooks-suite`**: un hook
+que bloquee un commit (o al menos lo advierta) si la rama actual en un
+working directory compartido no coincide con la que el agente registró
+al iniciar su tarea.
+
+**Verificación real de punta a punta, tras el DNS** (Marco creó el
+registro A de `vault.64bitstudio.com` vía la API de Cloudflare, mismo
+patrón que el resto de subdominios): certificado real de Let's Encrypt
+emitido; confirmado desde fuera de la VM que las rutas fuera del
+allowlist (`/v1/sys/health`, `/ui/`, `/v1/secret/jenkins`,
+`/v1/sys/seal-status`, `/`) responden `404`, mientras que un login con
+credenciales inválidas sí llega hasta Vault (`400`, mensaje real de
+Vault) -- confirma que la ruta permitida enruta de verdad y las demás no
+existen desde fuera. Login AppRole + `encrypt`/`decrypt` reales con las
+credenciales de `auth-core-mc-local-dev` contra el subdominio público:
+round-trip exitoso. Detalle de la migración del dato real (tenant local
+con credenciales de Google/Facebook, ahora "64Bit Studio") y la
+verificación end-to-end del lado de la aplicación en
+`auth-core-mc/docs/ARQUITECTURA.md`, ticket 051 -- no se repite aquí.
