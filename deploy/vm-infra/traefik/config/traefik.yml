@@ -8,6 +8,23 @@
 entryPoints:
   web:
     address: ":8000"
+    # Hallazgo real (galgoth-studio ticket 093, verificación en vivo del
+    # flujo "vincular cuenta de Google"): nginx (el único que puede
+    # alcanzar este puerto, ver docker-compose.yml) SÍ manda un
+    # `X-Forwarded-Proto: https` correcto, pero sin `trustedIPs` Traefik
+    # no confía en headers reenviados de nadie y los sobreescribe con el
+    # esquema de SU PROPIA conexión entrante (`http`, porque nginx→Traefik
+    # es HTTP plano puertas adentro) antes de reenviar al contenedor de
+    # cada servicio. Cualquier backend que construya una URL absoluta a
+    # partir del request (el caso real: el `redirect_uri` de OAuth2 de
+    # auth-core-mc, que Google rechazaba con `redirect_uri_mismatch` por
+    # traer `http://` en vez de `https://`) queda expuesto a este mismo
+    # bug — no es específico de un servicio, es de esta topología
+    # entera. `127.0.0.1/32` porque ese es exactamente (y únicamente)
+    # quien puede conectarse a este entrypoint.
+    forwardedHeaders:
+      trustedIPs:
+        - "127.0.0.1/32"
 
 providers:
   docker:
