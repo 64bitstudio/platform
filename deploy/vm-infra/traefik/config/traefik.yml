@@ -20,11 +20,24 @@ entryPoints:
     # auth-core-mc, que Google rechazaba con `redirect_uri_mismatch` por
     # traer `http://` en vez de `https://`) queda expuesto a este mismo
     # bug — no es específico de un servicio, es de esta topología
-    # entera. `127.0.0.1/32` porque ese es exactamente (y únicamente)
-    # quien puede conectarse a este entrypoint.
+    # entera.
+    #
+    # Segunda vuelta (verificado con un curl real tras el primer intento
+    # con solo 127.0.0.1/32, que NO funcionó): el puerto se publica como
+    # `127.0.0.1:8000:8000` (ver docker-compose.yml), pero Docker hace el
+    # DNAT vía iptables antes de que el paquete llegue al contenedor —
+    # Traefik ve la conexión como originada en la gateway de la red
+    # `edge` (`172.20.0.1`, `docker network inspect edge`), NUNCA
+    # literalmente `127.0.0.1`, aunque desde el HOST la conexión sí sea
+    # loopback. Se listan ambas IPs a propósito: `127.0.0.1/32` documenta
+    # la intención real (nginx, en el mismo host) aunque hoy no sea la que
+    # Traefik observa; `172.20.0.1/32` es la que hace falta para que esto
+    # funcione con la implementación actual de Docker en esta VM. Ambas
+    # siguen siendo exactamente quien ya podía alcanzar este entrypoint.
     forwardedHeaders:
       trustedIPs:
         - "127.0.0.1/32"
+        - "172.20.0.1/32"
 
 providers:
   docker:
